@@ -1,0 +1,993 @@
+#! /usr/bin/env python
+
+import sys, xmltodict, urllib2, optparse, threading, re, curses, curses.wrapper
+import time, socket, json, logging, collections, traceback, signal, termios
+import pprint
+
+_INTERNED = ['Cluster', 'DC', 'EXTENDED_STATUS', 'HINTCOUNT', 'Hostname', 'HOSTNAMES',
+             'LIVE', 'Load', 'READ_LATENCY_FIFTEEN_MINUTE', 'LABEL',
+             'READ_LATENCY_FIVE_MINUTE', 'READ_LATENCY_INSTANTANEOUS',
+             'READ_LATENCY_ONE_MINUTE', 'READ_RATE_FIFTEEN_MINUTE',
+             'READ_RATE_FIVE_MINUTE', 'READ_RATE_ONE_MINUTE', 'Severity', 'STATUS',
+             'WRITE_LATENCY_FIFTEEN_MINUTE', 'WRITE_LATENCY_FIVE_MINUTE',
+             'WRITE_LATENCY_INSTANTANEOUS', 'WRITE_LATENCY_ONE_MINUTE',
+             'WRITE_RATE_FIFTEEN_MINUTE', 'WRITE_RATE_FIVE_MINUTE', 'DEAD', 
+             'WRITE_RATE_ONE_MINUTE', 'PendingTasks', 'read_latency_averages',
+             'write_latency_averages', 'RACK', 'CLUSTER_NAME', 'Compactions',
+             'ITEM', 'JAVA_OBJECT', 'URL', 'VALUE', 'OPERATION','ONE', 'FIVE', 'FIFTEEN', 'POPS',
+]
+
+for value in _INTERNED: locals()[value.upper()] = value
+
+_debuginfo = collections.deque()
+def debug(item):
+    _debuginfo.append(item)
+    if len(_debuginfo) > 160: del _debuginfo[0]
+    return
+
+def sigwinch_handler(n, frame):
+    curses.initscr()
+    return
+
+class MovingAverages(object):
+    '''Handle moving averages as often displayed by programs like top(8).'''
+    def __init__(self):
+        self.queue = collections.deque() # Where we keep our data stashed away
+        self.one = self.five = self.fifteen = 0.0
+        return
+    def add(self, value):
+        '''Add a new value, timestamped appropriately.  Throw away any old
+        values, then re-compute the moving averages.'''
+        now = time.time()
+        self.queue.appendleft((value, now))
+        # These two lines discard old stuff
+        old = now - 900         # 15 minutes
+        while self.queue and self.queue[-1][1] < old: del self.queue[-1]
+        total = 0.0
+        count = 0
+
+        then = now - 60
+        while count < len(self.queue):
+            value, timestamp = self.queue[count]
+            if timestamp < then: break
+            count += 1
+            total += value
+        self.one = total/count
+
+        then = now - 300
+        while count < len(self.queue):
+            value, timestamp = self.queue[count]
+            if timestamp < then: break
+            count += 1
+            total += value
+        self.five = total/count
+
+        while count < len(self.queue):
+            value, timestamp = self.queue[count]
+            count += 1
+            total += value
+        self.fifteen = total/count
+        return self
+
+
+class CursedIntDataAttribute(dict):
+    url_template = 'http://{Hostname:s}:8081/{OPERATION:s}?objectname={JAVA_OBJECT:s}&attribute={ITEM:s}&operation={ITEM:s}&template=identity'
+    bean_designator = 'MBean'
+    return_value_designators = ['Attribute', '@value']
+    default_value = 0
+    operation = 'getattribute'
+    datatype = int
+    default_format = '{VALUE:>4d}'
+    def __init__(self, hostname, java_object, item, *args, **kwargs):
+        '''Set some default values for the dictionary, largely for debugging and interpolation purposes'''
+        dict.__init__(self, *args, **kwargs)
+        self[HOSTNAME] = hostname
+        self[JAVA_OBJECT] = java_object
+        self[ITEM] = item
+        self[OPERATION] = self.operation # This seems silly, but it lets subclasses override while still letting us do interpolation.
+        self[URL] = self.url_template.format(**self)
+        self[VALUE] = self.default_value
+        return None
+        
+    def __call__(self):
+        '''Make the requisite HTTP request to get a new data item, storing the
+        coerced result into self[VALUE] (or store the default value if some part of
+        the process fails.'''
+        try:
+            data = {}
+            fh = urllib2.urlopen(self[URL], None, 30)
+            data_string = fh.read()
+            fh.close()
+            data = xmltodict.parse(data_string)
+            if not data:
+                debug('%(Hostname)s:%(ITEM)s.__call__: no results returned for %(URL)s' % self)
+                self[VALUE] = self.default_value
+            else:
+                self[VALUE] = self.datatype(data[self.bean_designator][self.return_value_designators[0]][self.return_value_designators[1]])
+                debug('%(Hostname)s:%(ITEM)s.__call__: set value to %(VALUE)s' % self)
+        except Exception as e:
+            debug(('%(Hostname)s:%(ITEM)s.__call__: Unable to load data for %(URL)s: ' % self) + str(e) + str(data))
+            self[VALUE] = self.default_value
+        return self[VALUE]
+        
+    def draw(self, window, y, x, color=0, warning=None, critical=None, newfmt=None, length=0):
+        '''Standard display method for these values.
+
+        (window,y,x) are the expected curses items.
+
+        "color" is the curses attribute set to use by default.  I'm
+        cheating big-time here and assuming that the default color should
+        be the result of curses.color_pair(0) AND that the result of that
+        will always be 0.  This is probably FRAGILE.
+
+        "warning" and "critical", if set, should be a list/tuple where the
+        first item is a test value and the second item is a curses
+        attribute set.  If either of the tests is true, the appropriate
+        attribute set will override the default attribute set.
+
+        newfmt is a format string using the new style of
+        formatting.
+
+        length, if greater than zero, will guarantee that the displayed
+        string does not exceed a certain length.
+
+        '''
+        debug('draw: keys=%s' % str(self.keys()))
+        if newfmt: display_value = newfmt.format(**self)
+        else: display_value = str(self)
+        if critical and self[VALUE] > critical[0]: color = critical[1]
+        elif warning and self[VALUE] > warning[0]: color = warning[1]
+        if length: window.addnstr(y, x, display_value, length, color)
+        else: window.addstr(y, x, display_value, color)
+        return
+
+
+    def __add__(self, other):
+        try: return self[VALUE] + other
+        except: return self[VALUE] + other[VALUE]
+    def __div__(self, other):
+        try: return self[VALUE] / other
+        except: return self[VALUE] / other[VALUE]
+    def __str__(self): return self.default_format.format(**self)
+    def type_coercion_data_dict_to_int(self, datastring):
+        try:
+            return sum(eval(datastring.replace('=', ':')).values())
+        except:
+            debug('CursedIntDictDataOperation.type_coercion: unable to eval %s' % datastring)
+        return 0
+
+class CursedStringDataAttribute(CursedIntDataAttribute):
+    datatype = str
+    default_value = 'nodata'
+    default_format = '{VALUE:s}'
+
+class CursedFloatDataAttribute(CursedIntDataAttribute):
+    datatype = float
+    default_value = 0.0
+    default_format = '{VALUE:>6.2f}'
+
+class CursedIntDictDataOperation(CursedIntDataAttribute):
+    '''This is designed to invoke a JMX function which returns a (possibly
+    ordered) Dict where all the values are INTs.  It will use the sum of those
+    values as its result.'''
+    datatype = CursedIntDataAttribute.type_coercion_data_dict_to_int
+    bean_designator = 'MBeanOperation'
+    return_value_designators = ['Operation', '@return']
+    operation = 'invoke'
+    default_format = '{VALUE:>8d}'
+
+
+class CursedSeverity(CursedFloatDataAttribute):
+    def __init__(self, hostname):
+        '''Cheating here for no good reason other than to emphasize the specialness of this one.'''
+        CursedFloatDataAttribute.__init__(self, hostname, 'org.apache.cassandra.db:type=CompactionManager', PENDINGTASKS)
+        self[COMPACTIONS] = CursedStringDataAttribute(hostname, 'org.apache.cassandra.db:type=CompactionManager', 'Compactions')
+        return None
+
+    def __call__(self):
+        '''Kick off a thread to get the compaction data before we get our own, then rejoin it.  Parallelism FTW@'''
+        compact = self[COMPACTIONS]
+        t = threading.Thread(target=compact)
+        t.daemon = True
+        t.start()
+        CursedFloatDataAttribute.__call__(self)
+        t.join()
+        total = 0.0
+        done = 0.0
+        if len(compact[VALUE]) > 4: compact[VALUE] = compact[VALUE][2:-2].replace('}','')
+        for row in compact[VALUE].split(','):
+            if 'total=' in row: total += int(row.split('total=')[-1])
+            if 'completed=' in row: done += int(row.split('completed=')[-1])
+        if total: percent = (total - done)/total
+        else: percent = 1
+        self[VALUE] = (self[VALUE] - len(compact[VALUE].split('},'))) + percent
+        
+
+class CursedByteDataAttribute(CursedFloatDataAttribute):
+    default_format = '{VALUE:>6.2f} {LABEL}'
+    def __init__(self, *args, **kwargs):
+        CursedFloatDataAttribute.__init__(self, *args, **kwargs)
+        self[LABEL] = 'B'
+        return None
+    def __str__(self):
+        '''Bytes are useful things, but my mind things in megs, gigs, etc.
+        '''
+        raw = self[VALUE]
+        label = 'B'
+        for l in ['KB', 'MB', 'GB', 'TB', 'PB']:
+            if raw < 1024: break
+            raw = raw/1024.0
+            label = l
+        return self.default_format.format(VALUE=raw, LABEL=label)
+    
+
+class CursedLatencyAverage(CursedIntDataAttribute):
+    datatype = float
+    default_value = 0.0
+    default_format = '{ONE:>6.2f}/{FIVE:>6.2f}/{FIFTEEN:>6.2f}'
+    def __init__(self, *args, **kwargs):
+        CursedIntDataAttribute.__init__(self, *args, **kwargs)
+        self.averages = MovingAverages()
+        self[VALUE] = 0.0
+        self[ONE] = 0.0
+        self[FIVE] = 0.0
+        self[FIFTEEN] = 0.0
+        return None
+    def __call__(self):
+        '''Cassandra hard-codes latency to be measured in MICROseconds.  I want to
+        keep track of, and display in, seconds.
+
+        '''
+        raw = CursedIntDataAttribute.__call__(self)/1000000.0
+        self[VALUE] = raw
+        self.averages.add(raw)
+        self[ONE] = self.averages.one
+        self[FIVE] = self.averages.five
+        self[FIFTEEN] = self.averages.fifteen
+        return raw
+
+    def draw(self, window, y, x, color=0, warning=None, critical=None, newfmt=None, length=0, averages=False):
+        '''Standard display method for these values.
+
+        (window,y,x) are the expected curses items.
+
+        "color" is the curses attribute set to use by default.  I'm
+        cheating big-time here and assuming that the default color should
+        be the result of curses.color_pair(0) AND that the result of that
+        will always be 0.  This is probably FRAGILE.
+
+        "warning" and "critical", if set, should be a list/tuple where the
+        first item is a test value and the second item is a curses
+        attribute set.  If either of the tests is true, the appropriate
+        attribute set will override the default attribute set.
+
+        newfmt is a format string using the new style of
+        formatting.
+
+        length, if greater than zero, will guarantee that the displayed
+        string does not exceed a certain length.
+
+        '''
+        debug('draw: keys=%s' % str(self.keys()))
+        if newfmt: display_value = newfmt.format(**self)
+        elif averages: display_value = '/'.join([self.default_format]*3).format(**self)
+        else: display_value = self.default_format.format(**self)
+        if critical and self[VALUE] > critical[0]: color = critical[1]
+        elif warning and self[VALUE] > warning[0]: color = warning[1]
+        if length: window.addnstr(y, x, display_value, length, color)
+        else: window.addstr(y, x, display_value, color)
+        return
+
+
+# This is here because
+# 1) It has to be after all of the individual JMX object type declarations,
+# 2) it has to be before CursedCluster.
+#
+# Its purpose is to provide a single list of keys and functions.  Each of
+# the functions is initialized as function(hostname, *args)
+host_attribute_set = {
+    LOAD: (CursedByteDataAttribute, ('org.apache.cassandra.db:type=StorageService', LOAD)),
+    SEVERITY: (CursedSeverity, ()),
+    STATUS: (CursedStringDataAttribute, ('org.apache.cassandra.db:type=StorageService', 'OperationMode')),
+    READ_LATENCY_INSTANTANEOUS: (CursedLatencyAverage, ('org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency', '75thPercentile')),
+    READ_RATE_ONE_MINUTE: (CursedFloatDataAttribute, ('org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency', 'OneMinuteRate')),
+    READ_RATE_FIVE_MINUTE: (CursedFloatDataAttribute, ('org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency', 'FiveMinuteRate')),
+    READ_RATE_FIFTEEN_MINUTE: (CursedFloatDataAttribute, ('org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency', 'FifteenMinuteRate')),
+    WRITE_LATENCY_INSTANTANEOUS: (CursedLatencyAverage, ('org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency', '75thPercentile')),
+    WRITE_RATE_ONE_MINUTE: (CursedFloatDataAttribute, ('org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency', 'OneMinuteRate')),
+    WRITE_RATE_FIVE_MINUTE: (CursedFloatDataAttribute, ('org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency', 'FiveMinuteRate')),
+    WRITE_RATE_FIFTEEN_MINUTE: (CursedFloatDataAttribute, ('org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency', 'FifteenMinuteRate')),
+    HINTCOUNT: (CursedIntDictDataOperation, ('org.apache.cassandra.db:type=HintedHandoffManager', 'countPendingHints')),
+    }
+    
+class CursedCluster(CursedStringDataAttribute):
+    '''This is a really specialized version of CursedStringDataAttribute, since
+    there should be only one *and* it's going to do a lot of string
+    processing and item creation.
+
+    '''
+    datatype = str
+    default_value = ''
+    default_format = '{VALUE}'
+    ENDPOINT_SPLITTER = re.compile('^/', re.MULTILINE).split
+
+    def __init__(self, hostname, delay=300):
+        '''In addition to the superclass startup, we extract the value of delay
+        from the passed in arguments (defaulting to 300), set a couple of
+        instance variables, load up the initial data, and fire up the refresh loop.
+        '''
+        self.delay = delay
+        CursedStringDataAttribute.__init__(self, hostname, 'org.apache.cassandra.net:type=FailureDetector', 'AllEndpointStates')
+        self[HOSTNAMES] = {}
+        self[POPS] = []
+        # Get the cluster name, it should never change!
+        self[CLUSTER_NAME] = CursedStringDataAttribute(hostname,
+                                                       'org.apache.cassandra.db:type=StorageService',
+                                                       'ClusterName')()
+        self()                  # Load the data up once!
+        t = threading.Thread(target=self._refresh_loop)
+        t.daemon = True
+        t.start()
+        return None
+    def __call__(self):
+        '''As well as the standard superclass functionality, we parse the returned
+        value into a bunch of hosts, each with a few static attributes, and
+        initialize each host with a set of data.  Adding more data items to
+        check should be done HERE.
+
+        '''
+        data_string = CursedIntDataAttribute.__call__(self)
+        new_host_list = {}
+        new_pop_list = {}
+        for row in self.ENDPOINT_SPLITTER(data_string):
+            try:
+                debug(row)
+                if not row: continue
+                if 'STATUS:remov' in row: continue
+                row_pieces = row.split('\n  ')
+                complete_address_set = socket.gethostbyaddr(row_pieces[0])
+                debug('get_gossip_information: gethostbyaddr returned %s' % str(complete_address_set))
+                endpoint = complete_address_set[0].replace('.cint','')
+                new_host = new_host_list.setdefault(endpoint, {})
+                new_host[LIVE] = True
+                for line in row_pieces[1:]:
+                    key, value = line.split(':', 1)
+                    if key == RACK:
+                        rack_string = value.strip()
+                        new_host[key] = ' '*(5-len(rack_string)) + rack_string
+                    if key == DC:
+                        new_pop_list[value] = True
+                        new_host[key] = value.strip()
+                for key in host_attribute_set:
+                    function, args = host_attribute_set[key] 
+                    new_host[key] = function(endpoint, *args)
+                new_host[READ_RATE_ONE_MINUTE].default_format = "{VALUE:5.0f}"
+                new_host[WRITE_RATE_ONE_MINUTE].default_format = "{VALUE:5.0f}"
+
+            except Exception as e: debug('CursedCluster.__call__: ' + str(e))
+        if new_host_list: self[HOSTNAMES] = new_host_list
+        if new_pop_list: self[POPS] = new_pop_list.keys()
+        return self
+    def _refresh_loop(self):
+        '''Simple little infinite loop defined on the class because I think it's
+        cleaner than a lambda.
+
+        '''
+        while 1:
+            time.sleep(self.delay)
+            self()
+
+class Cluster(object):
+    # this is kind of an evil faux-function-definition
+    ENDPOINT_SPLITTER = re.compile('^/', re.MULTILINE).split
+    refresh_delay = 3
+    refresh = True
+
+    def __init__(self, hostname, header_window, data_window, status_window):
+        self.compaction_averages = MovingAverages()
+        self.hint_averages = MovingAverages()
+        self.header_window = header_window
+        self.data_window = data_window
+        self.status_window = status_window
+        
+        self.last_refresh = 0.0
+        self.sort_order = 0
+        self.cluster_data = CursedCluster(hostname)
+        self.dead_nodes = []
+        self.item = SEVERITY
+        self.redraw_semaphore = threading.Semaphore()
+        self.redraw_lock = threading.Lock()
+        
+        sys.stdout.write(']0; Cassandra Top - %s ' % self.cluster_data[CLUSTER_NAME])
+        self.draw_data = self.draw_cluster_data
+        self.title = 'Cluster Summary'
+        self.good = curses.color_pair(0)
+        self.warning = curses.color_pair(1)
+        self.bad = curses.color_pair(2)
+        self.green = curses.color_pair(3)
+        curses.init_pair(1, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+        curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
+        curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        return
+
+    def dispatch(self, group, function):
+        group.append(threading.Thread(target=function))
+        group[-1].daemon = True
+        group[-1].start()
+        return
+    def rejoin(self, group):
+        for t in group: t.join()
+        return
+    def __call__(self):
+        '''this is the updating loop'''
+        self.redraw_semaphore.acquire() # Prevent the drawing routine from
+                                        # doing anything until we have
+                                        # data.
+        drawer = threading.Thread(target = self.draw)
+        drawer.daemon = True
+        drawer.start()
+        while 1:
+            now = time.time()
+            thread_group = []
+            for host in self.cluster_data[HOSTNAMES].values():
+                for item in host.values():
+                    if isinstance(item, dict): self.dispatch(thread_group, item)
+            self.rejoin(thread_group)
+            for hostname in self.cluster_data[HOSTNAMES]:
+                host = self.cluster_data[HOSTNAMES][hostname]
+                host[LIVE] = True
+                if host[STATUS][VALUE] != 'NORMAL':
+                    host[LIVE] = False
+                    debug('%s marked down because "%s" is not "NORMAL"' % (hostname, host[STATUS]))
+                if host[LOAD][VALUE] == 0.0:
+                    host[LIVE] = False
+                    debug('%s marked down because the load is 0.0 (may just be new)' % hostname)
+            then = time.time()
+            self.stop_refresh()
+            self.redraw_semaphore.release()
+            self.start_refresh()
+            self.last_refresh = then - now
+            left = self.refresh_delay - self.last_refresh
+            if left > 0: time.sleep(left)
+        return
+
+    def draw(self):
+        while 1:
+            self.redraw_semaphore.acquire()
+            try:
+                self.draw_header()
+                self.draw_data()
+                self.draw_status()
+            except: debug(traceback.format_exc())
+        return
+        
+    def draw_labelled_item(self, window, starty, startx, label, value, warning=None, critical=None, fmt=None, hilight=False, length=0):
+        if fmt: display_value = fmt % value
+        else: display_value = str(value)
+        if hilight: window.addstr(starty, startx, label, curses.A_BOLD | self.green)
+        else: window.addstr(starty, startx, label, curses.A_BOLD)
+        if critical and value > critical: color = self.bad
+        elif warning and value > warning: color = self.warning
+        else: color = self.good
+        if length: window.addnstr(display_value, length, color)
+        else: window.addstr(display_value, color)
+        return
+
+    def draw_header(self):
+        dead_count = len([x for x in self.cluster_data[HOSTNAMES].values() if not x[LIVE]])
+        host_count = len(self.cluster_data[HOSTNAMES]) + dead_count
+        compaction_data = 0.0
+        read_rate_one = 0.0
+        read_rate_five = 0.0
+        read_rate_fifteen = 0.0
+        write_rate_one = 0.0
+        write_rate_five = 0.0
+        write_rate_fifteen = 0.0
+        read_latency_one = 0.0
+        read_latency_five = 0.0
+        read_latency_fifteen = 0.0
+        write_latency_one = 0.0
+        write_latency_five = 0.0
+        write_latency_fifteen = 0.0
+        hintcount = 0
+        for x in self.cluster_data[HOSTNAMES].values():
+            compaction_data += x[SEVERITY][VALUE]
+            read_rate_one += x[READ_RATE_ONE_MINUTE][VALUE]
+            read_rate_five += x[READ_RATE_FIVE_MINUTE][VALUE]
+            read_rate_fifteen += x[READ_RATE_FIFTEEN_MINUTE][VALUE]
+            write_rate_one += x[WRITE_RATE_ONE_MINUTE][VALUE]
+            write_rate_five += x[WRITE_RATE_FIVE_MINUTE][VALUE]
+            write_rate_fifteen += x[WRITE_RATE_FIFTEEN_MINUTE][VALUE]
+            read_latency_one += x[READ_LATENCY_INSTANTANEOUS][ONE]
+            read_latency_five += x[READ_LATENCY_INSTANTANEOUS][FIVE]
+            read_latency_fifteen += x[READ_LATENCY_INSTANTANEOUS][FIFTEEN]
+            write_latency_one += x[WRITE_LATENCY_INSTANTANEOUS][ONE]
+            write_latency_five += x[WRITE_LATENCY_INSTANTANEOUS][FIVE]
+            write_latency_fifteen += x[WRITE_LATENCY_INSTANTANEOUS][FIFTEEN]
+            hintcount += x[HINTCOUNT][VALUE]
+        self.compaction_averages.add(compaction_data)
+        self.hint_averages.add(hintcount)
+        self.header_window.clear()
+        self.draw_labelled_item(self.header_window, 0, 0, 'Live Nodes: ', len(self.cluster_data[HOSTNAMES]))
+        self.draw_labelled_item(self.header_window, 1, 0, 'Dead Nodes: ', dead_count, warning=host_count*0.25, critical=host_count*0.5)
+        self.draw_labelled_item(self.header_window, 0, 16, 'Compactions: ', (self.compaction_averages.one,self.compaction_averages.five,self.compaction_averages.fifteen), fmt='%5.2f/%5.2f/%5.2f')
+        self.draw_labelled_item(self.header_window, 1, 16, 'Hints: ', (self.hint_averages.one, self.hint_averages.fifteen), fmt='%12d/%12d')
+        self.draw_labelled_item(self.header_window, 0, 53, 'Rrate: ', (read_rate_one, read_rate_five, read_rate_fifteen), fmt='%5.0f/%5.0f/%5.0f')
+        self.draw_labelled_item(self.header_window, 1, 53, 'Wrate: ', (write_rate_one, write_rate_five, write_rate_fifteen), fmt='%5.0f/%5.0f/%5.0f')
+        self.draw_labelled_item(self.header_window, 0, 78, 'Rlatency: ', (read_latency_one/1000, read_latency_five/1000, read_latency_fifteen/1000), fmt='%5.2f/%5.2f/%5.2f')
+        self.draw_labelled_item(self.header_window, 1, 78, 'Wlatency: ', (write_latency_one/1000, write_latency_five/1000, write_latency_fifteen/1000), fmt='%5.2f/%5.2f/%5.2f')
+        self.refresh and self.header_window.refresh()
+        return
+
+    def size_convert(self, value):
+        label = 'B'
+        for l in ['KB', 'MB', 'GB', 'TB', 'PB']:
+            if value < 1024: break
+            value = value/1024.0
+            label = l
+        return (value, label)
+    
+    def draw_cluster_data(self):
+        (RESTY, RESTX) = self.data_window.getmaxyx()
+        self.data_window.clear()
+        self.data_window.standout()
+        self.draw_labelled_item(self.data_window, 0,  1, DC, '', hilight=(self.sort_order == 0))
+        self.draw_labelled_item(self.data_window, 0,  5, 'Nodes', '')
+        self.draw_labelled_item(self.data_window, 0, 11, 'Racks', '')
+        self.draw_labelled_item(self.data_window, 0, 20, 'Load', '', hilight=(self.sort_order == 1))
+        self.draw_labelled_item(self.data_window, 0, 28, 'Comps', '', hilight=(self.sort_order == 2))
+        self.draw_labelled_item(self.data_window, 0, 35, 'Rlat', '', hilight=(self.sort_order == 3))
+        self.draw_labelled_item(self.data_window, 0, 40, 'Rrate', '', hilight=(self.sort_order == 4))
+        self.draw_labelled_item(self.data_window, 0, 47, 'Wlat', '', hilight=(self.sort_order == 5))
+        self.draw_labelled_item(self.data_window, 0, 52, 'Wrate', '', hilight=(self.sort_order == 6))
+        self.draw_labelled_item(self.data_window, 0, 62, 'Hints', '', hilight=(self.sort_order == 7))
+        
+        self.data_window.standend()
+        summarized_data = {}
+        debug('draw_cluster_data: new summary created')
+        for host in self.cluster_data[HOSTNAMES].values():
+            dc = host[DC]
+            debug('draw_cluster_data: DC is ' + dc)
+            if not summarized_data.has_key(dc):
+                debug('draw_cluster_data: added DC - ' + dc)
+                summarized_data[dc] = host.copy()
+                summarized_data[dc][LIVE] = host[LIVE] and 1 or 0
+                summarized_data[dc][DEAD] = not host[LIVE] and 1 or 0
+                summarized_data[dc][RACK] = {host[RACK]: True}
+            else:
+                if host[LIVE]: summarized_data[dc][LIVE] += 1
+                else: summarized_data[dc][DEAD] += 1
+                summarized_data[dc][RACK][host[RACK]] = True
+                for key in [LOAD, SEVERITY,
+                            READ_LATENCY_INSTANTANEOUS,
+                            READ_RATE_ONE_MINUTE,
+                            WRITE_LATENCY_INSTANTANEOUS,
+                            WRITE_RATE_ONE_MINUTE, HINTCOUNT]:
+                    try: summarized_data[dc][key] = host[key] + summarized_data[dc][key]
+                    except Exception as e: debug('draw_cluster_data - exception when summarizing: ' + str(e))
+        # Do sorting here
+        y = 0
+        sort_key = [DC, LOAD, SEVERITY, READ_LATENCY_INSTANTANEOUS,
+                    READ_RATE_ONE_MINUTE, WRITE_LATENCY_INSTANTANEOUS, WRITE_RATE_ONE_MINUTE, HINTCOUNT][self.sort_order]
+        for row in sorted(summarized_data.values(), cmp=lambda x,y: cmp(x[sort_key], y[sort_key]), reverse = (self.sort_order != 0)):
+            y += 1
+            self.draw_labelled_item(self.data_window, y, 0, '', row[DC])
+            self.draw_labelled_item(self.data_window, y, 5, '', row[LIVE] + row[DEAD], fmt='%2d/', length=3)
+            self.draw_labelled_item(self.data_window, y, 8, '', row[DEAD], length=2, critical=row[LIVE]/3, warning=0)
+            self.draw_labelled_item(self.data_window, y, 12, '', len(row[RACK]), fmt='%2d', length=2)
+            self.draw_labelled_item(self.data_window, y, 16, '', '%7.2f %s' % self.size_convert(row[LOAD]), length=10)
+            self.draw_labelled_item(self.data_window, y, 27, '', row[SEVERITY], fmt='%6.2f', length=6)
+            self.draw_labelled_item(self.data_window, y, 34, '', row[READ_LATENCY_INSTANTANEOUS], fmt='%5.0f', length=6)
+            self.draw_labelled_item(self.data_window, y, 40, '', row[READ_RATE_ONE_MINUTE], fmt='%5.0f', length=6)
+            self.draw_labelled_item(self.data_window, y, 46, '', row[WRITE_LATENCY_INSTANTANEOUS], fmt='%5.0f', length=6)
+            self.draw_labelled_item(self.data_window, y, 52, '', row[WRITE_RATE_ONE_MINUTE], fmt='%5.0f', length=6)
+            self.draw_labelled_item(self.data_window, y, 58, '', row[HINTCOUNT], fmt='%9d')
+
+        self.refresh and self.data_window.refresh()
+        return
+
+    def draw_data_dict_item(self, y, x, datadict, key, length=0, fmt = None):
+        if not fmt:
+            if length: fmt = '{0:%d}' % length
+            else: fmt = '{0}'
+        try:
+            value = fmt.format(datadict[key])
+        except Exception as e:
+            self.data_window.addstr(y, x, 'NODATA', self.bad)
+            debug('draw_data_dict_item:' + key + '  ' + str(e))
+            return
+        if length:
+            self.data_window.addnstr(y, x, value, length)
+        else:   self.data_window.addstr(y, x, value)
+        return
+
+    def sorted_host_key_order(self):
+        if self.draw_data == self.draw_host_data:
+            if self.sort_order == 1: # Sort by DC/host
+                return sorted(self.cluster_data[HOSTNAMES].keys(), cmp=lambda x,y: cmp(self.cluster_data[HOSTNAMES][x][DC]+x, self.cluster_data[HOSTNAMES][y][DC]+y))
+
+            if self.sort_order == 2: # Sort by RACK/host
+                return sorted(sorted(self.cluster_data[HOSTNAMES].keys()), cmp=lambda x,y: cmp(self.cluster_data[HOSTNAMES][x][RACK], self.cluster_data[HOSTNAMES][y][RACK]))
+
+            if self.sort_order == 3: # Sort by LOAD
+                return sorted(sorted(self.cluster_data[HOSTNAMES].keys()), cmp=lambda x,y: cmp(self.cluster_data[HOSTNAMES][y][LOAD][VALUE], self.cluster_data[HOSTNAMES][x][LOAD][VALUE]))
+
+            if self.sort_order == 4: # Sort by SEVERITY (compactions)
+                return sorted(self.cluster_data[HOSTNAMES].keys(), cmp=lambda x,y: cmp(self.cluster_data[HOSTNAMES][y][SEVERITY][VALUE], self.cluster_data[HOSTNAMES][x][SEVERITY][VALUE]))
+
+            if self.sort_order == 5:
+                return sorted(self.cluster_data[HOSTNAMES].keys(), cmp=lambda x,y: cmp(self.cluster_data[HOSTNAMES][y][READ_LATENCY_INSTANTANEOUS][VALUE], self.cluster_data[HOSTNAMES][x][READ_LATENCY_INSTANTANEOUS][VALUE]))
+
+            if self.sort_order == 6:
+                return sorted(self.cluster_data[HOSTNAMES].keys(), cmp=lambda x,y: cmp(self.cluster_data[HOSTNAMES][y][READ_RATE_ONE_MINUTE][VALUE], self.cluster_data[HOSTNAMES][x][READ_RATE_ONE_MINUTE][VALUE]))
+
+            if self.sort_order == 7:
+                return sorted(self.cluster_data[HOSTNAMES].keys(), cmp=lambda x,y: cmp(self.cluster_data[HOSTNAMES][y][WRITE_LATENCY_INSTANTANEOUS][VALUE], self.cluster_data[HOSTNAMES][x][WRITE_LATENCY_INSTANTANEOUS][VALUE]))
+
+            if self.sort_order == 8:
+                return sorted(self.cluster_data[HOSTNAMES].keys(), cmp=lambda x,y: cmp(self.cluster_data[HOSTNAMES][y][WRITE_RATE_ONE_MINUTE][VALUE], self.cluster_data[HOSTNAMES][x][WRITE_RATE_ONE_MINUTE][VALUE]))
+
+            if self.sort_order == 9:
+                return sorted(sorted(self.cluster_data[HOSTNAMES].keys()), cmp=lambda x,y: cmp(self.cluster_data[HOSTNAMES][y][HINTCOUNT][VALUE], self.cluster_data[HOSTNAMES][x][HINTCOUNT][VALUE]))
+
+            #if self.sort_order == '1': This is the default, so we'll leave it as a fall-through
+            return sorted(self.cluster_data[HOSTNAMES].keys())
+
+        if self.draw_data == self.draw_cluster_item:
+            # sorts by DC by Host regardless
+            return sorted(self.cluster_data[HOSTNAMES].keys(), cmp=lambda x,y: cmp(self.cluster_data[HOSTNAMES][x][DC]+x, self.cluster_data[HOSTNAMES][y][DC]+y))
+        pass
+
+
+    def draw_host_data(self):
+        (RESTY, RESTX) = self.data_window.getmaxyx()
+        self.data_window.clear()
+        self.draw_labelled_item(self.data_window, 0, 0, HOSTNAME, '', hilight=(self.sort_order == 0))
+        self.draw_labelled_item(self.data_window, 0, 10, DC, '', hilight=(self.sort_order == 1))
+        self.draw_labelled_item(self.data_window, 0, 16, 'Rack', '', hilight=(self.sort_order == 2))
+        self.draw_labelled_item(self.data_window, 0, 22, 'Status', '')
+        self.draw_labelled_item(self.data_window, 0, 31, 'Load', '', hilight=(self.sort_order == 3))
+        self.draw_labelled_item(self.data_window, 0, 40, 'Comps', '', hilight=(self.sort_order == 4))
+        self.draw_labelled_item(self.data_window, 0, 47, 'Rlat', '', hilight=(self.sort_order == 5))
+        self.draw_labelled_item(self.data_window, 0, 52, 'Rrate', '', hilight=(self.sort_order == 6))
+        self.draw_labelled_item(self.data_window, 0, 59, 'Wlat', '', hilight=(self.sort_order == 7))
+        self.draw_labelled_item(self.data_window, 0, 64, 'Wrate', '', hilight=(self.sort_order == 8))
+        self.draw_labelled_item(self.data_window, 0, 73, 'Hints', '', hilight=(self.sort_order == 9))
+
+        host_list = self.sorted_host_key_order()
+        y = 0
+        for host in host_list:
+            y += 1
+            if not y < RESTY: continue
+            data_set = self.cluster_data[HOSTNAMES][host]
+            if not data_set[LIVE]: self.data_window.addnstr(y, 0, host.split('.')[0], 10, self.bad)
+            else: self.data_window.addnstr(y, 0, host.split('.')[0], 10)
+            self.draw_data_dict_item(y, 10, data_set, DC, length=5)
+            self.draw_data_dict_item(y, 16, data_set, RACK, length=5)
+            data_set[STATUS].draw(self.data_window, y, 22, length=6)
+            data_set[LOAD].draw(self.data_window, y, 29, length=9)
+            data_set[SEVERITY].draw(self.data_window, y, 40, length=5)
+            data_set[READ_LATENCY_INSTANTANEOUS].draw(self.data_window, y, 46, length=5)
+            data_set[READ_RATE_ONE_MINUTE].draw(self.data_window, y, 52, length=5)
+            data_set[WRITE_LATENCY_INSTANTANEOUS].draw(self.data_window, y, 58, length=5)
+            data_set[WRITE_RATE_ONE_MINUTE].draw(self.data_window, y, 64, length=5)
+            data_set[HINTCOUNT].draw(self.data_window, y, 70)
+            if data_set.get(STATUS, None) == DEAD: self.draw_data_dict_item(y, 50, data_set, EXTENDED_STATUS)
+        self.refresh and self.data_window.refresh()
+        return
+
+    def draw_cluster_item(self):
+        self.data_window.clear()
+        self.draw_labelled_item(self.data_window, 0, 0, HOSTNAME, '')
+        self.draw_labelled_item(self.data_window, 0, 30, DC, '')
+        self.draw_labelled_item(self.data_window, 0, 62, 'Cluster', '')
+        host_list = self.sorted_host_key_order()
+        cluster_total = None
+        writer = ClusterObject(self.data_window, self.item, self.cluster_data[HOSTNAMES][host_list[0]][DC], 1)
+        
+        for host in host_list:
+            if not writer.dc == self.cluster_data[HOSTNAMES][host][DC]:
+                if cluster_total == None: cluster_total = writer.finish()
+                elif getattr(cluster_total, 'count', None): cluster_total = map(sum, zip(cluster_total, writer.finish()))
+                else: cluster_total += writer.finish()
+                writer = ClusterObject(self.data_window, self.item, self.cluster_data[HOSTNAMES][host][DC], writer.row+1)
+            writer.entry(self.cluster_data[HOSTNAMES][host], host.split('.')[0])
+        if cluster_total == None: cluster_total = writer.finish()
+        if getattr(cluster_total, 'count', None):
+            cluster_total = map(sum, zip(cluster_total, writer.finish()))
+        else:
+            cluster_total += writer.finish()
+        if self.item == LOAD:
+            value, label = self.size_convert(cluster_total)
+            self.data_window.addstr(1, 60, writer.fmt.format(VALUE=value, LABEL=label))
+        else:
+            self.data_window.addstr(1, 60, writer.fmt.format(VALUE=cluster_total))
+                
+        self.refresh and self.data_window.refresh()
+        return
+
+        
+    def draw_status(self):
+        (RESTY, RESTX) = self.status_window.getmaxyx()
+        status_message = 'Update frequency: %ds (%0.2f)' % (self.refresh_delay, self.last_refresh)
+        l = len(status_message)
+        t = len(self.title)
+        if l+t+5 > RESTX:
+            tx = l+1
+            tlen = RESTX - l - 4
+        else:
+            tx = (RESTX - t) - 3
+            tlen = t
+        self.status_window.clear()
+        self.status_window.addstr(status_message)
+        try:
+            self.status_window.addnstr(0, tx, self.title, tlen, curses.color_pair(3) | curses.A_STANDOUT)
+        except:
+            raise Exception('tx=%d, RESTX=%d, RESTY=%d' % (tx,RESTX, RESTY))
+        self.refresh and self.status_window.refresh()
+        return
+    def stop_refresh(self):
+        return self.redraw_lock.acquire()
+
+    def start_refresh(self):
+        try: return self.redraw_lock.release()
+        except: return
+
+class ClusterObject(object):
+    '''Utility class to make printing a data item for a ring just a little neater'''
+    def __init__(self, window, item, dc, row):
+        self.window = window
+        self.item = item
+        self.dc = dc
+        self.row = self.top_row = row
+        self.maxy, self.maxx = self.window.getmaxyx()
+        if isinstance(item, basestring): self.total = 0
+        else: self.total = [0] * len(item)
+        return
+
+    def entry(self, obj, hostname):
+        self.fmt = obj[self.item].default_format
+        self.total += obj[self.item][VALUE]
+        if self.row < self.maxy:
+            try:
+                self.window.addstr(self.row, 0, hostname)
+                obj[self.item].draw(self.window, self.row, 15)
+            except: debug(traceback.format_exc())
+        self.row += 1
+        return
+
+    def finish(self):
+        if self.top_row < self.maxy:
+            value = self.total
+            try:
+                self.window.addstr(self.top_row, 30, self.dc)
+                self.window.addstr(self.top_row, 35, self.fmt.format(VALUE=value))
+            except: debug(traceback.format_exc())
+        return self.total
+
+helpstrings = [
+    ('', 'Summary information in the first couple lines is for the entire cluster.'),
+    ('', ''),
+    ('q', 'Exit the program (immediately)'),
+    ('c', 'Display cluster summary data'),
+    ('h', 'Display host data'),
+    ('s', 'Display severity (compaction) data'),
+    ('l', 'Display load data'),
+    ('r', 'Display read data'),
+    ('w', 'Display write data'),
+    ('', ''),
+    ('+', 'Increase the delay between updates (takes effect after next update)'),
+    ('-', 'Decrease the delay between updates (takes effect after next update)'),
+    ('', ''),
+    ('1-9', 'Column to sort on, OR switch values sets in read/write data'),
+    ('<>', 'Previous/next sort column, OR switch values sets in read/write data'),
+    ('', ''),
+    ('?', 'This help screen'),
+    ]
+
+
+def display_help(topscr):
+    (RESTY, RESTX) = topscr.getmaxyx()
+    helpscr = topscr.subwin(RESTY-4,RESTX-4,2,2)
+    (RESTY, RESTX) = helpscr.getmaxyx()
+    helpscr.clrtobot()
+    helpscr.box()
+    y = 1
+    for parts in helpstrings:
+        y += 1
+        helpscr.addnstr(y, 3, '%s: %s' % parts, RESTX-4)
+    helpscr.addstr(RESTY-1, 3, 'Press any key to leave help')
+    helpscr.refresh()
+    key = helpscr.getkey()
+    helpscr.erase()
+    curses.doupdate()
+    
+    
+def display_initial(topscr):
+    (RESTY, RESTX) = topscr.getmaxyx()
+    message = 'Please wait while I perform the initial data fetch'
+    width = len(message) + 4
+    helpscr = topscr.subwin(3, width, RESTY/2-1, (RESTX-width)/2)
+    helpscr.clrtobot()
+    helpscr.box()
+    helpscr.addstr(1,2,message)
+    helpscr.refresh()
+    helpscr.erase()
+    curses.doupdate()
+    
+    
+def main(stdscr, hostname):
+    display_initial(stdscr)
+    (RESTY, RESTX) = stdscr.getmaxyx()
+    header_win = stdscr.subwin(5, RESTX, 0, 0)
+    data_win = stdscr.subwin(RESTY-6, RESTX, 5, 0)
+    status_win = stdscr.subwin(1, RESTX-19, RESTY-1, 0)
+    target = Cluster(hostname, header_win, data_win, status_win)
+    debug(str(target.cluster_data))
+    if not target.cluster_data:
+        debug('Unable to contact any seeds')
+        raise SystemExit('Unable to contact any seeds')
+    target.redraw_semaphore.release()
+    cluster = threading.Thread(target = target)
+    cluster.daemon = True
+    cluster.start()
+    stdscr.addstr(RESTY-1, RESTX-19, "Press '?' for help")
+    stdscr.refresh()
+    read_list = [(READ_RATE_ONE_MINUTE, 'Read Rate (1 minute)'),
+                 (READ_RATE_FIVE_MINUTE, 'Read Rate (5 minutes)'),
+                 (READ_RATE_FIFTEEN_MINUTE, 'Read Rate (15 minutes)'),
+                 (READ_LATENCY_ONE_MINUTE, 'Read Latency (1 minute)'),
+                 (READ_LATENCY_FIVE_MINUTE, 'Read Latency (5 minutes)'),
+                 (READ_LATENCY_FIFTEEN_MINUTE, 'Read Latency (15 minutes)'),
+             ]
+    write_list = [(WRITE_RATE_ONE_MINUTE, 'Write Rate (1 minute)'),
+                 (WRITE_RATE_FIVE_MINUTE, 'Write Rate (5 minutes)'),
+                 (WRITE_RATE_FIFTEEN_MINUTE, 'Write Rate (15 minutes)'),
+                 (WRITE_LATENCY_ONE_MINUTE, 'Write Latency (1 minute)'),
+                 (WRITE_LATENCY_FIVE_MINUTE, 'Write Latency (5 minutes)'),
+                 (WRITE_LATENCY_FIFTEEN_MINUTE, 'Write Latency (15 minutes)'),
+             ]
+    while 1:
+        try:
+            key = stdscr.getkey()
+            if key == 'q': break
+            elif key == '+': Cluster.refresh_delay = Cluster.refresh_delay + 1
+            elif key == '-':
+                if Cluster.refresh_delay > 1: Cluster.refresh_delay = Cluster.refresh_delay - 1
+            elif key == 'c':
+                target.draw_data = target.draw_cluster_data
+                target.title = 'Cluster Summary'
+            elif key == 'h':
+                target.draw_data = target.draw_host_data
+                target.title = 'Hosts Summary'
+                target.sort_order = 0
+            elif key == 's':
+                target.item = SEVERITY
+                target.draw_data = target.draw_cluster_item
+                target.title = 'Compactions'
+            elif key == 'l':
+                target.item = LOAD
+                target.draw_data = target.draw_cluster_item
+                target.title = 'Load'
+            elif key == 'r':
+                target.sort_order = target.sort_order % len(read_list)
+                target.draw_data = target.draw_cluster_item
+                target.item, target.title = read_list[target.sort_order]
+            elif key == 'w':
+                target.sort_order = target.sort_order % len(write_list)
+                target.draw_data = target.draw_cluster_item
+                target.item, target.title = write_list[target.sort_order]
+            elif key in '1234567890':
+                value = (int(key) - 1 + 10) % 10
+                if target.title in ['Compactions', 'Load']: pass
+                elif target.title == 'Cluster Summary':
+                    if value < 8 and value > -1: target.sort_order = value
+                elif target.title == 'Hosts Summary':
+                    if value < 10 and value > -1: target.sort_order = value
+                elif target.title in [x[1] for x in read_list]:
+                    if value < 6 and value > -1:
+                        target.sort_order = value % len(read_list)
+                        target.item, target.title = read_list[target.sort_order]
+                elif target.title in [x[1] for x in write_list]:
+                    if value < 6 and value > -1:
+                        target.sort_order = value % len(write_list)
+                        target.item, target.title = write_list[target.sort_order]
+            elif key in '<>':
+                if target.title in ['Compactions', 'Load']: pass
+                elif target.title == 'Cluster Summary':
+                    if key == '>': target.sort_order = (target.sort_order + 1) % 8
+                    else: target.sort_order = (target.sort_order + 7) % 9
+                elif target.title == 'Hosts Summary':
+                    if key == '>': target.sort_order = (target.sort_order + 1) % 10
+                    else: target.sort_order = (target.sort_order + 9) % 10
+                elif target.title in [x[1] for x in read_list]:
+                    if key == '>': target.sort_order = (target.sort_order + 1) % len(read_list)
+                    else: target.sort_order = (target.sort_order + 5) % len(read_list)
+                    target.item, target.title = read_list[target.sort_order]
+                elif target.title in [x[1] for x in write_list]:
+                    if key == '>': target.sort_order = (target.sort_order + 1) % len(write_list)
+                    else: target.sort_order = (target.sort_order + 5) % len(write_list)
+                    target.item, target.title = write_list[target.sort_order]
+
+            if key == '?':
+                target.stop_refresh()
+                display_help(stdscr)
+                target.start_refresh()
+            target.redraw_semaphore.release()
+        except KeyboardInterrupt: raise SystemExit
+        except: pass
+    return target
+
+def one_shot(key, hostname):
+    '''Extract the name of a status item, get that item, print it to stdout,
+    and exit.
+
+    Parameters:
+      key      - Name of a status variable
+      hostname - A host name.  Just one, really.
+    
+    Return value: does not return
+
+    '''
+    if not host_attribute_set.has_key(key):
+        logging.fatal('No such status item: %s', key)
+        exit(-1)
+    function, args = host_attribute_set[key]
+    data_item = function(hostname, *args)
+    data_item()
+    print data_item[VALUE]
+    exit()
+
+def tp_stat(key, hostname):
+    '''Extract one value from JMX, kind of like nodetool tpstats.
+    '''
+    data_item = CursedStringDataAttribute(hostname, 'org.apache.cassandra.metrics:type=ThreadPools,path=request,scope=%sStage,name=%sTasks' % key, 'Value')
+    data_item()
+    print data_item[VALUE]
+    exit()
+
+def random_stat(key, hostname, jmx_object):
+    '''Extract one value from JMX, kind of like nodetool tpstats.
+    '''
+    data_item = CursedStringDataAttribute(hostname, jmx_object, key)
+    data_item()
+    print data_item[VALUE]
+    exit()
+    
+parser = optparse.OptionParser(description='Top-like program for Cassandra.  '
+                               'The seed_host is used as the starting point to discover the cluster.',
+                               usage = '%prog [options] seed_host')
+parser.add_option('-d', '--debug', dest='debug', default=False, action='store_true')
+parser.add_option('-o', '--one-shot', help='Variable name to extract from the server once.  Valid status variables are: ' + ' '.join(host_attribute_set.keys()))
+parser.add_option('-t', '--tpstat', nargs=2, help='Variable and status to extract from the server (e.g. --tpstat ReadStage Pending)')
+
+options, args = parser.parse_args()
+if not args:
+    parser.print_usage()
+    exit(-1)
+if options.debug: logging.basicConfig(level=logging.DEBUG)
+else: logging.basicConfig(level=logging.WARNING)
+
+if options.one_shot: one_shot(options.one_shot, args[0])
+if options.tpstat: tp_stat(options.tpstat, args[0])
+if options.tpstat: random_stat(options.tpstat, args[0])
+
+signal.signal(signal.SIGWINCH, sigwinch_handler)
+old_tty = termios.tcgetattr(sys.stdin.fileno())
+retdata = object()
+try:
+    retdata = curses.wrapper(main, args[0])
+except KeyboardInterrupt:
+    pass
+except Exception, e:
+    raise
+
+termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, old_tty)
+#logging.debug(pprint.pformat( getattr(retdata,'cluster_data', None)))
+logging.debug('%s', 'live nodes')
+logging.debug(getattr(retdata, 'hostnames', None))
+logging.debug('dead nodes')
+logging.debug(pprint.pformat(getattr(retdata, 'dead_nodes', None)))
+
+logging.debug('debuginfo')
+logging.debug(pprint.pformat(list(_debuginfo)))
