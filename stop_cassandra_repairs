@@ -1,0 +1,11 @@
+#! /bin/bash
+
+if [ -z "${1}" ] ; then
+    print "Usage: ${0} hostname [hostname ...]"
+    exit
+fi
+
+while test -n "${1}" ; do
+    wget -q -O /dev/null "http://${1}:8081/invoke?operation=forceTerminateAllRepairSessions&objectname=org.apache.cassandra.db%3Atype%3DStorageService"
+    shift
+done
