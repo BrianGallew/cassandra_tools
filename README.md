@@ -19,6 +19,48 @@ Cassandra repairs have an unfortunate tendency to hang, but there are no tools t
 stop_cassandra_repairs $HUNG_NODE [$HUNG_NODE ...]
 ```
 
+# cassandra_repair_scheduler.py
+
+Script for scheduling repairs on your cluster.  Requires the use of
+https://github.com/BrianGallew/cassandra_range_repair to work.
+
+##Basic Usage
+```
+echo 0 */4 * * * /usr/local/bin/cassandra_repair_scheduler.py >> /etc/crontab
+```
+
+##Help
+```
+usage: cassandra_repair_scheduler.py [-h] [-v] [-d] [--syslog FACILITY]
+                                     [--logfile FILENAME] [-H HOSTNAME]
+                                     [-p PORT] [-U USERNAME] [-P PASSWORD]
+                                     [-t TTL] [-k KEYSPACE]
+                                     [--cqlversion CQLVERSION]
+                                     [-r RANGE_REPAIR_TOOL]
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -v, --verbose         Verbose output
+  -d, --debug           Debugging output
+  --syslog FACILITY     Send log messages to the syslog
+  --logfile FILENAME    Send log messages to a file
+  -H HOSTNAME, --hostname HOSTNAME
+                        Hostname (default: mactheknife.local)
+  -p PORT, --port PORT  Port (default: 9160)
+  -U USERNAME, --username USERNAME
+                        Username (if necessary)
+  -P PASSWORD, --password PASSWORD
+                        Password. (prompt if user provided but not password)
+  -t TTL, --ttl TTL     TTL (default: 1728000)
+  -k KEYSPACE, --keyspace KEYSPACE
+                        Keyspace to use (default: operations)
+  --cqlversion CQLVERSION
+                        CQL version (default: 3.0.5)
+  -r RANGE_REPAIR_TOOL, --range_repair_tool RANGE_REPAIR_TOOL
+                        Range repair tool path (default:
+                        /usr/local/bin/range_repair.py)
+```
+
 # MX4J
 
 http://mx4j.sourceforge.net/ is, among other things, a JMX<->HTML bridge.
