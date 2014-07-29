@@ -1,5 +1,7 @@
 #! /usr/bin/env python
 
+# Author: Brian Gallew <bgallew@llnw.com> or <geek@gallew.org>
+
 import sys, xmltodict, urllib2, optparse, threading, re, curses, curses.wrapper
 import time, socket, json, logging, collections, traceback, signal, termios
 import pprint

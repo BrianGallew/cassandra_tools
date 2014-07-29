@@ -1,4 +1,7 @@
 #! /usr/bin/env python
+
+# Author: Brian Gallew <bgallew@llnw.com> or <geek@gallew.org>
+
 """
 Run repairs on a regularly scheduled basis.  Drop this in cron, not more
 often than hourly.
