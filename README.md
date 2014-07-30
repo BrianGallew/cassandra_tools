@@ -59,6 +59,7 @@ optional arguments:
   -r RANGE_REPAIR_TOOL, --range_repair_tool RANGE_REPAIR_TOOL
                         Range repair tool path (default:
                         /usr/local/bin/range_repair.py)
+  --watch               See the live repair status.
 ```
 
 # MX4J

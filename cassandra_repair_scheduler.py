@@ -21,7 +21,6 @@ Workflow:
 
 """
 
-import sys
 import logging
 import argparse
 import platform
@@ -29,7 +28,12 @@ import getpass
 import time
 import subprocess
 import cql
+import curses
+import curses.wrapper
+import threading
 
+COMPLETED = "Completed"
+DELAY = 'delay'
 
 class CqlWrapper(object):
 
@@ -63,7 +67,8 @@ class CqlWrapper(object):
                     WHERE "nodename" = :nodename"""
     GET_LOCAL_STATUS = """SELECT "nodename", "repair_status" FROM "repair_status"
                           WHERE "data_center" = :data_center ALLOW FILTERING"""
-    COMPLETED = "Completed"
+    # This next statement could get ugly if you have 1000+ nodes.
+    GET_ALL_STATUS = """SELECT "nodename", "data_center", "repair_status", WRITETIME("repair_status") FROM "repair_status" """
     MUTEX_START = """INSERT INTO "mutex" ("nodename", "data_center")
                      VALUES (:nodename, :data_center) USING TTL :ttl"""
     MUTEX_CHECK = """SELECT "nodename", "data_center" FROM "mutex" """
@@ -71,8 +76,8 @@ class CqlWrapper(object):
     SELECT_ALL_DATACENTERS = """SELECT data_center FROM system.peers"""
     SELECT_MY_DATACENTER = """SELECT data_center FROM system.local"""
     REPAIR_START = """INSERT INTO "repair_status" ("nodename", "data_center", "repair_status")
-                      VALUES (:nodename, :data_center, 'Started')"""
-    REPAIR_UPDATE = """UPDATE "repair_status" SET "repair_status" = :newstatus
+                      VALUES (:nodename, :data_center, 'Started') USING TTL :ttl"""
+    REPAIR_UPDATE = """UPDATE "repair_status" USING TTL :ttl SET "repair_status" = :newstatus
                        WHERE "nodename" = :nodename AND "data_center" = :data_center"""
 
     def __init__(self, option_group):
@@ -178,6 +183,17 @@ class CqlWrapper(object):
         logging.debug(str(data))
         return data
 
+    def get_all_status(self):
+        """Get the status of all repairs.
+        """
+        while True:
+            try:
+                return self.query(self.GET_ALL_STATUS, consistency_level="ONE")
+            except:
+                self.close()
+                time.sleep(1)
+        return []
+
     def close(self):
         """Shut down the connection gracefully."""
         self.conn.close()
@@ -204,7 +220,7 @@ class CqlWrapper(object):
                                    data_center=self.data_center)
 
         if result:
-            already_running = [x[0] for x in result if x[1] != self.COMPLETED]
+            already_running = [x[0] for x in result if x[1] != COMPLETED]
             if already_running:
                 logging.info("Another node is repairing.: %s", already_running[0])
                 return False
@@ -249,13 +265,142 @@ class CqlWrapper(object):
                 continue
             step, repair_command = line.split(" ", 1)
             self.query(self.REPAIR_UPDATE, nodename=self.nodename,
-                       newstatus=step, data_center=self.data_center)
+                       newstatus=step, data_center=self.data_center,
+                       ttl=self.option_group.ttl)
             self.close()        # Individual repairs may be slow
             logging.debug(repair_command)
             subprocess.call(repair_command, shell=True)
         self.query(
-            self.REPAIR_UPDATE, nodename=self.nodename, newstatus=self.COMPLETED)
+            self.REPAIR_UPDATE, nodename=self.nodename, newstatus=COMPLETED)
         return
+
+def status_update_loop(connection, options, status_dict):
+    """Update a status dictionary periodically with the results of a CQL query.
+    This never exits, and should be used inside a thread.
+    :param connection: CqlWrapper (used for queries)
+    :param options: control dictionary
+    :param status_dict: a dictionary which will hold all of the returned data
+    """
+    while True:
+        start_time = time.time()
+        for row in connection.get_all_status():
+            status_dict[row[0]] = row
+        logging.debug("status_update_loop: status: %s", str(status_dict))
+        end_time = time.time()
+        delta_time = options[DELAY] - (end_time - start_time)
+        if delta_time > 0: time.sleep(delta_time)
+
+def row_sort_function(left, right):
+    '''Function for sorting query results for the entire cluster.  Using a real
+    function because it'll be called a lot, and lambdas can get expensive.
+
+    :param left: first item to check
+    :param right: second item to check
+
+    '''
+    return cmp(left[3], right[3])
+
+def format_time(seconds):
+    """Convert time in seconds to a human-readabase value.
+    :param seconds: Time to be converted
+    :returns: formatted string
+    """
+    if seconds < 60:
+        return "{seconds:0.2f} seconds".format(seconds=seconds)
+    seconds = seconds / 60.0
+    if seconds < 60:
+        return "{seconds:0.2f} minutes".format(seconds=seconds)
+    seconds = seconds / 60.0
+    if seconds < 24:
+        return "{seconds:0.2f} hours".format(seconds=seconds)
+    seconds = seconds / 24.0
+    return "{seconds:0.2f} days".format(seconds=seconds)
+
+def screen_update_loop(window, options, status_dict):
+    """Updates a curses window with data from the status dictionary.
+    This never exits, and should be used inside a thread.
+    :param window: curses window
+    :param options: control dictionary
+    :param status_dict: a dictionary which will hold all of the returned data
+    """
+    status_message = "Running: {running:3d}  Complete: {complete:3d}          Refresh: {delay:d}"
+    status_format = "{hostname:35s} {status:20s} {delay}"
+    color_warning = curses.color_pair(1)
+    color_bad = curses.color_pair(2)
+    color_green = curses.color_pair(3)
+    curses.init_pair(1, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
+    curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)
+
+    while True:
+        start_time = time.time()
+        (RESTY, _) = window.getmaxyx()
+        window.clear()
+        display_data = []
+        complete_data = []
+        for row in status_dict:
+            if status_dict[row][2] == COMPLETED:
+                complete_data.append(status_dict[row])
+            else:
+                display_data.append(status_dict[row])
+
+        window.addstr(1, 0, status_message.format(complete=len(complete_data),
+                                                  running=len(display_data),
+                                                  delay=options[DELAY]))
+        display_data.sort(row_sort_function)
+        complete_data.sort(row_sort_function)
+        window.addstr(3, 0, status_format.format(hostname="Hostname",
+                                                 status="Status",
+                                                 delay="Time since last update"), curses.A_BOLD)
+        display_data.extend(complete_data)
+        logging.debug("all data: %s", str(display_data))
+        current_row = 4
+        for line in display_data:
+            if current_row > RESTY-1:
+                break
+            delta = time.time() - (line[3]/1000000.0)
+            if delta > 4*3600 and not line[2] == COMPLETED:
+                attribute = color_bad
+            elif delta > 2*3600 and not line[2] == COMPLETED:
+                attribute = color_warning
+            else:
+                attribute = color_green
+            window.addstr(current_row, 0, status_format.format(hostname=line[0],
+                                                               status=line[2],
+                                                               delay=format_time(delta)),
+                          attribute)
+            current_row += 1
+        delta_time = options[DELAY] - (time.time() - start_time)
+        if delta_time > 0: time.sleep(delta_time)
+        window.refresh()
+
+def watch(main_window, connection):
+    """Query Cassandra for the current repair status and display.
+    :param main_window: curses window
+    :param connection: CqlWrapper object
+    """
+    status_dict = {}
+    option_dict = {}
+    option_dict[DELAY] = 5
+    update_thread = threading.Thread(target=status_update_loop,
+                                     args=(connection, option_dict, status_dict))
+    update_thread.daemon = True
+    update_thread.start()
+
+    redraw_thread = threading.Thread(target=screen_update_loop,
+                                     args=(main_window, option_dict, status_dict))
+    redraw_thread.daemon = True
+    redraw_thread.start()
+
+    while 1:
+        try:
+            key = main_window.getkey()
+            if key == 'q': break
+            elif key == '+': option_dict[DELAY] = option_dict[DELAY] + 1
+            elif key == '-' and option_dict[DELAY] > 1: option_dict[DELAY] = option_dict[DELAY] - 1
+        except KeyboardInterrupt: raise SystemExit
+        except: pass
+    return status_dict
 
 
 def setup_logging(option_group):
@@ -319,6 +464,8 @@ def cli_parsing():
     parser.add_argument("-r", "--range_repair_tool",
                         default="/usr/local/bin/range_repair.py",
                         help="Range repair tool path (default: %(default)s)")
+    parser.add_argument("--watch", action="store_true", default=False,
+                        help="Watch the live repair status")
     options = parser.parse_args()
     setup_logging(options)
     if options.username and not options.password:
@@ -332,10 +479,13 @@ def main():
     logging.debug('main')
     options = cli_parsing()
     connection = CqlWrapper(options)
-    if connection.check_should_run():
-        connection.claim_repair()
-        # Arguably, this should not be done in the connection.
-        connection.run_repair()
+    if not options.watch:
+        if connection.check_should_run():
+            connection.claim_repair()
+            # Arguably, this should not be done in the connection.
+            connection.run_repair()
+    else:
+        print curses.wrapper(watch, connection)
     connection.close()
 
     return
