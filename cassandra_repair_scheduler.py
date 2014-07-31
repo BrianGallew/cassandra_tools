@@ -284,9 +284,13 @@ def status_update_loop(connection, options, status_dict):
     """
     while True:
         start_time = time.time()
+        new_names = []
         for row in connection.get_all_status():
             status_dict[row[0]] = row
+            new_names.append(row[0])
         logging.debug("status_update_loop: status: %s", str(status_dict))
+        for nodename in status_dict.keys():
+            if not nodename in new_names: del status_dict[nodename]
         end_time = time.time()
         delta_time = options[DELAY] - (end_time - start_time)
         if delta_time > 0: time.sleep(delta_time)
@@ -401,7 +405,7 @@ def watch(main_window, connection):
             elif key == '-' and option_dict[DELAY] > 1: option_dict[DELAY] = option_dict[DELAY] - 1
         except KeyboardInterrupt: raise SystemExit
         except: pass
-    return status_dict
+    return
 
 
 def setup_logging(option_group):
@@ -486,7 +490,7 @@ def main():
             # Arguably, this should not be done in the connection.
             connection.run_repair()
     else:
-        print curses.wrapper(watch, connection)
+        curses.wrapper(watch, connection)
     connection.close()
 
     return
