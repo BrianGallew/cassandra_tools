@@ -154,7 +154,7 @@ class CqlWrapper(object):
             self.query(cql_query.format(**locals()))
         return
 
-    def query_or_die(self, query_string, error_message, consistency_level="QUORUM", **kwargs):
+    def query_or_die(self, query_string, error_message, consistency_level="LOCAL_QUORUM", **kwargs):
         """Execute a query, on exception print an error message and exit.
         :param query_string: CQL to perform
         :param error_message: printed on error
@@ -166,7 +166,7 @@ class CqlWrapper(object):
             logging.fatal("%s: %s", error_message, e)
         exit(1)
 
-    def query(self, query_string, consistency_level="QUORUM", **kwargs):
+    def query(self, query_string, consistency_level="LOCAL_QUORUM", **kwargs):
         """Execute a query.
         :param query_string: CQL to perform
         :param kwargs: dictionary to use for parameter substitution in the CQL
@@ -244,7 +244,7 @@ class CqlWrapper(object):
         then remove the MUTEX."""
         self.query_or_die(self.REPAIR_START,
                           "Starting Repair", nodename=self.nodename,
-                          data_center=self.data_center)
+                          data_center=self.data_center, ttl=self.option_group.ttl)
         self.query_or_die(self.MUTEX_CLEANUP,
                           "Dropping MUTEX record",
                           nodename=self.nodename)
@@ -270,8 +270,9 @@ class CqlWrapper(object):
             self.close()        # Individual repairs may be slow
             logging.debug(repair_command)
             subprocess.call(repair_command, shell=True)
-        self.query(
-            self.REPAIR_UPDATE, nodename=self.nodename, newstatus=COMPLETED)
+        self.query(self.REPAIR_UPDATE, nodename=self.nodename,
+                   ttl=self.option_group.ttl, data_center=self.data_center,
+                   newstatus=COMPLETED)
         return
 
 def status_update_loop(connection, options, status_dict):
@@ -283,9 +284,13 @@ def status_update_loop(connection, options, status_dict):
     """
     while True:
         start_time = time.time()
+        new_names = []
         for row in connection.get_all_status():
             status_dict[row[0]] = row
+            new_names.append(row[0])
         logging.debug("status_update_loop: status: %s", str(status_dict))
+        for nodename in status_dict.keys():
+            if not nodename in new_names: del status_dict[nodename]
         end_time = time.time()
         delta_time = options[DELAY] - (end_time - start_time)
         if delta_time > 0: time.sleep(delta_time)
@@ -400,7 +405,7 @@ def watch(main_window, connection):
             elif key == '-' and option_dict[DELAY] > 1: option_dict[DELAY] = option_dict[DELAY] - 1
         except KeyboardInterrupt: raise SystemExit
         except: pass
-    return status_dict
+    return
 
 
 def setup_logging(option_group):
@@ -485,7 +490,7 @@ def main():
             # Arguably, this should not be done in the connection.
             connection.run_repair()
     else:
-        print curses.wrapper(watch, connection)
+        curses.wrapper(watch, connection)
     connection.close()
 
     return
