@@ -257,7 +257,8 @@ class CqlWrapper(object):
                "-D", self.data_center,
                "-H", self.nodename,
                "--dry-run"]     # So we get a list of commands to run.
-
+        if self.option_group.local:
+            cmd.append("--local")
         logging.debug("geting repair steps, this may take a while")
         repair_steps = subprocess.check_output(cmd).split('\n')
         for line in repair_steps:
@@ -469,6 +470,8 @@ def cli_parsing():
     parser.add_argument("-r", "--range_repair_tool",
                         default="/usr/local/bin/range_repair.py",
                         help="Range repair tool path (default: %(default)s)")
+    parser.add_argument("--local", default=False, action="store_true",
+                        help="Run the repairs in the local ring only")
     parser.add_argument("--watch", action="store_true", default=False,
                         help="Watch the live repair status")
     options = parser.parse_args()
