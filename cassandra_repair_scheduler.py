@@ -64,7 +64,7 @@ class CqlWrapper(object):
         """,
     ]
     GET_STATUS = """SELECT "repair_status" FROM "repair_status"
-                    WHERE "nodename" = :nodename"""
+                    WHERE "nodename" = :nodename AND "data_center" = :data_center"""
     GET_LOCAL_STATUS = """SELECT "nodename", "repair_status" FROM "repair_status"
                           WHERE "data_center" = :data_center ALLOW FILTERING"""
     # This next statement could get ugly if you have 1000+ nodes.
@@ -72,13 +72,14 @@ class CqlWrapper(object):
     MUTEX_START = """INSERT INTO "mutex" ("nodename", "data_center")
                      VALUES (:nodename, :data_center) USING TTL :ttl"""
     MUTEX_CHECK = """SELECT "nodename", "data_center" FROM "mutex" """
-    MUTEX_CLEANUP = """DELETE FROM "mutex" WHERE "nodename" = :nodename"""
+    MUTEX_CLEANUP = """DELETE FROM "mutex" WHERE "nodename" = :nodename AND "data_center" = :data_center"""
     SELECT_ALL_DATACENTERS = """SELECT data_center FROM system.peers"""
     SELECT_MY_DATACENTER = """SELECT data_center FROM system.local"""
     REPAIR_START = """INSERT INTO "repair_status" ("nodename", "data_center", "repair_status")
                       VALUES (:nodename, :data_center, 'Started') USING TTL :ttl"""
     REPAIR_UPDATE = """UPDATE "repair_status" USING TTL :ttl SET "repair_status" = :newstatus
                        WHERE "nodename" = :nodename AND "data_center" = :data_center"""
+    REPAIR_CLEANUP = """DELETE FROM "repair_status" WHERE "nodename" = :nodename AND "data_center" = :data_center"""
 
     def __init__(self, option_group):
         """Set up and manage our connection.
@@ -206,7 +207,8 @@ class CqlWrapper(object):
         """
         logging.debug("Check to see if we're already running a repair")
         result = self.query_or_die(
-            self.GET_STATUS, "Checking status", nodename=self.nodename)
+            self.GET_STATUS, "Checking status",
+            nodename=self.nodename, data_center=self.data_center)
         # If there's any result at all, either a run is in progress, or the
         # last completed run hasn't expired yet.  Either way, bail.
         if result:
@@ -235,7 +237,7 @@ class CqlWrapper(object):
                                    consistency_level="ONE",
                                    data_center=self.data_center)
         if not result or not [x[0] for x in result if x[1] == self.data_center][0] == self.nodename:
-            self.query(self.MUTEX_CLEANUP, nodename=self.nodename)
+            self.query(self.MUTEX_CLEANUP, nodename=self.nodename, data_center=self.data_center)
             return False
         return True
 
@@ -247,7 +249,8 @@ class CqlWrapper(object):
                           data_center=self.data_center, ttl=self.option_group.ttl)
         self.query_or_die(self.MUTEX_CLEANUP,
                           "Dropping MUTEX record",
-                          nodename=self.nodename)
+                          nodename=self.nodename,
+                          data_center=self.data_center)
         self.close()
         return
 
@@ -265,15 +268,28 @@ class CqlWrapper(object):
             if not line:
                 continue
             step, repair_command = line.split(" ", 1)
-            self.query(self.REPAIR_UPDATE, nodename=self.nodename,
-                       newstatus=step, data_center=self.data_center,
-                       ttl=self.option_group.ttl)
+            try:
+                self.query(self.REPAIR_UPDATE, nodename=self.nodename,
+                           newstatus=step, data_center=self.data_center,
+                           ttl=self.option_group.ttl)
+            except:
+                logging.warning("Failed to update repair status, continuing anyway")
             self.close()        # Individual repairs may be slow
             logging.debug(repair_command)
             subprocess.call(repair_command, shell=True)
-        self.query(self.REPAIR_UPDATE, nodename=self.nodename,
-                   ttl=self.option_group.ttl, data_center=self.data_center,
-                   newstatus=COMPLETED)
+        try:
+            self.query(self.REPAIR_UPDATE, nodename=self.nodename,
+                       ttl=self.option_group.ttl, data_center=self.data_center,
+                       newstatus=COMPLETED)
+        except:
+            logging.warning("Failed to update repair status, continuing anyway")
+        return
+
+    def reset_repair_status(self):
+        """Reset the repair status by removing the records from the database.
+        """
+        self.query(self.MUTEX_CLEANUP, nodename=self.nodename, data_center=self.data_center)
+        self.query(self.REPAIR_CLEANUP, nodename=self.nodename, data_center=self.data_center)
         return
 
 def status_update_loop(connection, options, status_dict):
@@ -474,6 +490,8 @@ def cli_parsing():
                         help="Run the repairs in the local ring only")
     parser.add_argument("--watch", action="store_true", default=False,
                         help="Watch the live repair status")
+    parser.add_argument("--reset", action="store_true", default=False,
+                        help="Reset the repair status for the host")
     options = parser.parse_args()
     setup_logging(options)
     if options.username and not options.password:
@@ -487,6 +505,9 @@ def main():
     logging.debug('main')
     options = cli_parsing()
     connection = CqlWrapper(options)
+    if options.reset:
+        connection.reset_repair_status()
+        exit()
     if not options.watch:
         if connection.check_should_run():
             connection.claim_repair()
