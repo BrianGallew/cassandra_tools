@@ -67,7 +67,7 @@ optional arguments:
 Script for discovering wide rows.  You'll need to convert your data to JSON, first.
 
 ##Usage
-
+```
  nodetool snapshot keyspace suspect_column_family
  #(cd into the relevant snapshot directory)
  for d in *-Data.db
@@ -76,7 +76,7 @@ Script for discovering wide rows.  You'll need to convert your data to JSON, fir
    sstable2json $d > $e
  done
  poison_pill_tester *.json
-
+```
 
 # MX4J
 
