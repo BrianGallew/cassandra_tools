@@ -62,6 +62,22 @@ optional arguments:
   --watch               See the live repair status.
 ```
 
+# poison_pill_tester
+
+Script for discovering wide rows.  You'll need to convert your data to JSON, first.
+
+##Usage
+
+ nodetool snapshot keyspace suspect_column_family
+ #(cd into the relevant snapshot directory)
+ for d in *-Data.db
+ do
+   e=$(echo $d | sed s,-Data.db,.json,)
+   sstable2json $d > $e
+ done
+ poison_pill_tester *.json
+
+
 # MX4J
 
 http://mx4j.sourceforge.net/ is, among other things, a JMX<->HTML bridge.
