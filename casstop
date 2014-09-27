@@ -6,7 +6,7 @@ import sys, xmltodict, urllib2, optparse, threading, re, curses, curses.wrapper
 import time, socket, json, logging, collections, traceback, signal, termios
 import pprint
 
-_INTERNED = ['Cluster', 'DC', 'EXTENDED_STATUS', 'HINTCOUNT', 'Hostname', 'HOSTNAMES',
+_INTERNED = ['Cluster', 'DC', 'EXTENDED_STATUS', 'Hostname', 'HOSTNAMES',
              'LIVE', 'Load', 'READ_LATENCY_FIFTEEN_MINUTE', 'LABEL',
              'READ_LATENCY_FIVE_MINUTE', 'READ_LATENCY_INSTANTANEOUS',
              'READ_LATENCY_ONE_MINUTE', 'READ_RATE_FIFTEEN_MINUTE',
@@ -299,7 +299,6 @@ host_attribute_set = {
     WRITE_RATE_ONE_MINUTE: (CursedFloatDataAttribute, ('org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency', 'OneMinuteRate')),
     WRITE_RATE_FIVE_MINUTE: (CursedFloatDataAttribute, ('org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency', 'FiveMinuteRate')),
     WRITE_RATE_FIFTEEN_MINUTE: (CursedFloatDataAttribute, ('org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency', 'FifteenMinuteRate')),
-    HINTCOUNT: (CursedIntDictDataOperation, ('org.apache.cassandra.db:type=HintedHandoffManager', 'countPendingHints')),
     }
     
 class CursedCluster(CursedStringDataAttribute):
@@ -387,7 +386,6 @@ class Cluster(object):
 
     def __init__(self, hostname, header_window, data_window, status_window):
         self.compaction_averages = MovingAverages()
-        self.hint_averages = MovingAverages()
         self.header_window = header_window
         self.data_window = data_window
         self.status_window = status_window
@@ -491,7 +489,6 @@ class Cluster(object):
         write_latency_one = 0.0
         write_latency_five = 0.0
         write_latency_fifteen = 0.0
-        hintcount = 0
         for x in self.cluster_data[HOSTNAMES].values():
             compaction_data += x[SEVERITY][VALUE]
             read_rate_one += x[READ_RATE_ONE_MINUTE][VALUE]
@@ -506,14 +503,11 @@ class Cluster(object):
             write_latency_one += x[WRITE_LATENCY_INSTANTANEOUS][ONE]
             write_latency_five += x[WRITE_LATENCY_INSTANTANEOUS][FIVE]
             write_latency_fifteen += x[WRITE_LATENCY_INSTANTANEOUS][FIFTEEN]
-            hintcount += x[HINTCOUNT][VALUE]
         self.compaction_averages.add(compaction_data)
-        self.hint_averages.add(hintcount)
         self.header_window.clear()
         self.draw_labelled_item(self.header_window, 0, 0, 'Live Nodes: ', len(self.cluster_data[HOSTNAMES]))
         self.draw_labelled_item(self.header_window, 1, 0, 'Dead Nodes: ', dead_count, warning=host_count*0.25, critical=host_count*0.5)
         self.draw_labelled_item(self.header_window, 0, 16, 'Compactions: ', (self.compaction_averages.one,self.compaction_averages.five,self.compaction_averages.fifteen), fmt='%5.2f/%5.2f/%5.2f')
-        self.draw_labelled_item(self.header_window, 1, 16, 'Hints: ', (self.hint_averages.one, self.hint_averages.fifteen), fmt='%12d/%12d')
         self.draw_labelled_item(self.header_window, 0, 53, 'Rrate: ', (read_rate_one, read_rate_five, read_rate_fifteen), fmt='%5.0f/%5.0f/%5.0f')
         self.draw_labelled_item(self.header_window, 1, 53, 'Wrate: ', (write_rate_one, write_rate_five, write_rate_fifteen), fmt='%5.0f/%5.0f/%5.0f')
         self.draw_labelled_item(self.header_window, 0, 78, 'Rlatency: ', (read_latency_one/1000, read_latency_five/1000, read_latency_fifteen/1000), fmt='%5.2f/%5.2f/%5.2f')
@@ -542,7 +536,6 @@ class Cluster(object):
         self.draw_labelled_item(self.data_window, 0, 40, 'Rrate', '', hilight=(self.sort_order == 4))
         self.draw_labelled_item(self.data_window, 0, 47, 'Wlat', '', hilight=(self.sort_order == 5))
         self.draw_labelled_item(self.data_window, 0, 52, 'Wrate', '', hilight=(self.sort_order == 6))
-        self.draw_labelled_item(self.data_window, 0, 62, 'Hints', '', hilight=(self.sort_order == 7))
         
         self.data_window.standend()
         summarized_data = {}
@@ -564,13 +557,13 @@ class Cluster(object):
                             READ_LATENCY_INSTANTANEOUS,
                             READ_RATE_ONE_MINUTE,
                             WRITE_LATENCY_INSTANTANEOUS,
-                            WRITE_RATE_ONE_MINUTE, HINTCOUNT]:
+                            WRITE_RATE_ONE_MINUTE]:
                     try: summarized_data[dc][key] = host[key] + summarized_data[dc][key]
                     except Exception as e: debug('draw_cluster_data - exception when summarizing: ' + str(e))
         # Do sorting here
         y = 0
         sort_key = [DC, LOAD, SEVERITY, READ_LATENCY_INSTANTANEOUS,
-                    READ_RATE_ONE_MINUTE, WRITE_LATENCY_INSTANTANEOUS, WRITE_RATE_ONE_MINUTE, HINTCOUNT][self.sort_order]
+                    READ_RATE_ONE_MINUTE, WRITE_LATENCY_INSTANTANEOUS, WRITE_RATE_ONE_MINUTE][self.sort_order]
         for row in sorted(summarized_data.values(), cmp=lambda x,y: cmp(x[sort_key], y[sort_key]), reverse = (self.sort_order != 0)):
             y += 1
             self.draw_labelled_item(self.data_window, y, 0, '', row[DC])
@@ -583,7 +576,6 @@ class Cluster(object):
             self.draw_labelled_item(self.data_window, y, 40, '', row[READ_RATE_ONE_MINUTE], fmt='%5.0f', length=6)
             self.draw_labelled_item(self.data_window, y, 46, '', row[WRITE_LATENCY_INSTANTANEOUS], fmt='%5.0f', length=6)
             self.draw_labelled_item(self.data_window, y, 52, '', row[WRITE_RATE_ONE_MINUTE], fmt='%5.0f', length=6)
-            self.draw_labelled_item(self.data_window, y, 58, '', row[HINTCOUNT], fmt='%9d')
 
         self.refresh and self.data_window.refresh()
         return
@@ -629,9 +621,6 @@ class Cluster(object):
             if self.sort_order == 8:
                 return sorted(self.cluster_data[HOSTNAMES].keys(), cmp=lambda x,y: cmp(self.cluster_data[HOSTNAMES][y][WRITE_RATE_ONE_MINUTE][VALUE], self.cluster_data[HOSTNAMES][x][WRITE_RATE_ONE_MINUTE][VALUE]))
 
-            if self.sort_order == 9:
-                return sorted(sorted(self.cluster_data[HOSTNAMES].keys()), cmp=lambda x,y: cmp(self.cluster_data[HOSTNAMES][y][HINTCOUNT][VALUE], self.cluster_data[HOSTNAMES][x][HINTCOUNT][VALUE]))
-
             #if self.sort_order == '1': This is the default, so we'll leave it as a fall-through
             return sorted(self.cluster_data[HOSTNAMES].keys())
 
@@ -654,7 +643,6 @@ class Cluster(object):
         self.draw_labelled_item(self.data_window, 0, 52, 'Rrate', '', hilight=(self.sort_order == 6))
         self.draw_labelled_item(self.data_window, 0, 59, 'Wlat', '', hilight=(self.sort_order == 7))
         self.draw_labelled_item(self.data_window, 0, 64, 'Wrate', '', hilight=(self.sort_order == 8))
-        self.draw_labelled_item(self.data_window, 0, 73, 'Hints', '', hilight=(self.sort_order == 9))
 
         host_list = self.sorted_host_key_order()
         y = 0
@@ -673,7 +661,6 @@ class Cluster(object):
             data_set[READ_RATE_ONE_MINUTE].draw(self.data_window, y, 52, length=5)
             data_set[WRITE_LATENCY_INSTANTANEOUS].draw(self.data_window, y, 58, length=5)
             data_set[WRITE_RATE_ONE_MINUTE].draw(self.data_window, y, 64, length=5)
-            data_set[HINTCOUNT].draw(self.data_window, y, 70)
             if data_set.get(STATUS, None) == DEAD: self.draw_data_dict_item(y, 50, data_set, EXTENDED_STATUS)
         self.refresh and self.data_window.refresh()
         return
