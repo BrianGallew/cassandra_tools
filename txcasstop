@@ -1,14 +1,168 @@
 #! /usr/bin/env python
-"""
-What this will do
+"""Cassandra "top" implementation using Twisted.  Queries the Cassandra
+JMX status information via MX4J, which must be installed on every Cassandra
+node.
 
-Based on the Python script template at
+:author: Brian Gallew <bgallew@llnw.com> or <geek@gallew.org>
+
+Starter source from the Python script template at
 https://github.com/BrianGallew/script_templates/blob/master/template.py
+
+MX4J is http://mx4j.sourceforge.net/
+
 """
 
 import logging
+import logging.handlers
 # Requires Python 2.7 or better
 import argparse
+# actual application required imports
+
+import sys
+import xmltodict
+import urllib2
+import optparse
+import threading
+import re
+import curses
+import time
+import socket
+import json
+import collections
+import traceback
+import signal
+import termios
+import pprint
+
+# Yay, Twisted!
+from twisted.internet import reactor
+
+
+class CursesStdIO:
+
+    """fake fd to be registered as a reader with the twisted reactor.
+       Curses classes needing input should extend this
+
+    Taken directly from https://twistedmatrix.com/documents/14.0.0/_downloads/cursesclient.py
+    """
+
+    def fileno(self):
+        """ We want to select on FD 0 """
+        return 0
+
+    def doRead(self):
+        """called when input is ready"""
+
+    def logPrefix(self):
+        return 'CursesClient'
+
+
+class Screen(CursesStdIO):
+
+    '''Based on https://twistedmatrix.com/documents/14.0.0/_downloads/cursesclient.py
+    '''
+    rows = 0
+    cols = 0
+    lines = []
+
+    def __init__(self, stdscr):
+        self.timer = 0
+        self.statusText = "TEST CURSES APP -"
+        self.searchText = ''
+        self.stdscr = stdscr
+
+        # set screen attributes
+        self.stdscr.nodelay(1)  # this is used to make input calls non-blocking
+        curses.cbreak()
+        self.stdscr.keypad(1)
+        curses.curs_set(0)     # no annoying mouse cursor
+
+        signal.signal(signal.SIGWINCH, self.updateSize)
+        self.updateSize()
+
+        curses.start_color()
+
+        # create color pair's 1 and 2
+        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
+        curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)
+
+        self.paintStatus(self.statusText)
+        self.stdscr.refresh()
+
+    def updateSize(self, *_):
+        self.rows, self.cols = self.stdscr.getmaxyx()
+
+    def connectionLost(self, reason):
+        self.close()
+
+    def addLine(self, text):
+        """ add a line to the internal list of lines"""
+
+        self.lines.append(text)
+        self.redisplayLines()
+
+    def redisplayLines(self):
+        """ method for redisplaying lines 
+            based on internal list of lines """
+
+        self.stdscr.clear()
+        self.paintStatus(self.statusText)
+        i = 0
+        index = len(self.lines) - 1
+        while i < (self.rows - 3) and index >= 0:
+            self.stdscr.addstr(self.rows - 3 - i, 0, self.lines[index],
+                               curses.color_pair(2))
+            i = i + 1
+            index = index - 1
+        self.stdscr.refresh()
+
+    def paintStatus(self, text):
+        if len(text) > self.cols:
+            raise TextTooLongError
+        self.stdscr.addstr(self.rows - 2, 0, text + ' ' * (self.cols - len(text)),
+                           curses.color_pair(1))
+        # move cursor to input line
+        self.stdscr.move(self.rows - 1, self.cols - 1)
+
+    def doRead(self):
+        """ Input is ready! """
+        curses.noecho()
+        self.timer = self.timer + 1
+        c = self.stdscr.getch()  # read a character
+
+        if c == curses.KEY_BACKSPACE:
+            self.searchText = self.searchText[:-1]
+
+        elif c == curses.KEY_ENTER or c == 10:
+            self.addLine(self.searchText)
+            # for testing too
+            try:
+                self.irc.sendLine(self.searchText)
+            except:
+                pass
+            self.stdscr.refresh()
+            self.searchText = ''
+
+        else:
+            if len(self.searchText) == self.cols - 2:
+                return
+            self.searchText = self.searchText + chr(c)
+
+        self.stdscr.addstr(self.rows - 1, 0,
+                           self.searchText + (' ' * (
+                               self.cols - len(self.searchText) - 2)))
+        self.stdscr.move(self.rows - 1, len(self.searchText))
+        self.paintStatus(self.statusText + ' %d' % len(self.searchText))
+        self.stdscr.refresh()
+
+    def close(self):
+        """ clean up """
+
+        curses.nocbreak()
+        self.stdscr.keypad(0)
+        curses.echo()
+        curses.endwin()
+
 
 def setup_logging(option_group):
     """Sets up logging in a syslog format by log level
@@ -25,17 +179,16 @@ def setup_logging(option_group):
         logger.setLevel(level=logging.WARNING)
 
     handlers = []
-    if option_group.syslog:
-        handlers.append(logging.SyslogHandler(facility=option_group.syslog))
-        # Use standard format here because timestamp and level will be added by syslogd.
     if option_group.logfile:
-        handlers.append(logging.FileHandler(option_group.logfile))
-        handlers[0].setFormatter(logging.Formatter(file_log_format))
-    if not handlers:
-        handlers.append(logging.StreamHandler())
-        handlers[0].setFormatter(logging.Formatter(stderr_log_format))
-    for handler in handlers:
+        handler = logging.FileHandler(option_group.logfile)
+        handler.setFormatter(logging.Formatter(file_log_format))
         logger.addHandler(handler)
+    else:
+        facility = option_group.syslog or 'USER'
+        # Use standard format here because timestamp and level will be added by
+        # syslogd.
+        logger.addHandler(
+            logging.handlers.SysLogHandler(facility=option_group.syslog))
     return
 
 
@@ -47,20 +200,46 @@ def main():
     parser.add_argument("-v", "--verbose", dest="verbose", action='store_true',
                         default=False, help="Verbose output")
     parser.add_argument("-d", "--debug", dest="debug", action='store_true',
-                        default=False, help="Debugging output")
+                        default=False, help="Debugging output, also opens a telnet server on port localhost:2222 with admin/aaa")
     parser.add_argument("--syslog", dest="syslog", metavar="FACILITY",
-                        help="Send log messages to the syslog")
+                        help="Send log messages to the syslog (default USER if neither syslog nor logfile are specified)")
     parser.add_argument("--logfile", dest="logfile", metavar="FILENAME",
                         help="Send log messages to a file")
     # script-specific options here
-    
+    parser.add_argument("--mx4j-port", metavar="PORT", default=8081,
+                        help="Port number on which MX4J listens")
+    parser.add_argument(dest='seed_host', metavar="SEED_HOST",
+                        help="Functional member of the Cassandra cluster")
+
     options = parser.parse_args()
     setup_logging(options)
 
     # Your code here.
-    
+    old_tty = termios.tcgetattr(sys.stdin.fileno())
+    stdscr = curses.initscr()  # initialize curses
+    screen = Screen(stdscr)   # create Screen object
+    #httpFactory = HTTPFactory(screen)
+    try:
+        # add screen object as a reader to the reactor
+        reactor.addReader(screen)
+        if options.debug:
+            import twisted.manhole.telnet
+            f = twisted.manhole.telnet.ShellFactory()
+            f.username = "admin"
+            f.password = "aaa"
+            f.namespace['foo'] = 12
+            reactor.listenTCP(2222, f, interface='localhost')
+
+        # reactor.connectTCP("irc.freenode.net",6667,ircFactory) # connect to
+        # IRC
+        reactor.run()  # have fun!
+    except:
+        pass
+    screen.close()
+    termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, old_tty)
+
     return
 
-    
+
 if __name__ == '__main__':
     main()
