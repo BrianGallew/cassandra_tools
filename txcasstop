@@ -36,6 +36,10 @@ import pprint
 
 # Yay, Twisted!
 from twisted.internet import reactor
+from twisted.internet.task import LoopingCall
+from twisted.web.client import getPage
+
+endpoints = {}                  # All Cassandra endpoints
 
 
 class CursesStdIO:
@@ -65,13 +69,15 @@ class Screen(CursesStdIO):
     cols = 0
     lines = []
 
-    def __init__(self, stdscr):
+    def __init__(self):
         self.timer = 0
         self.statusText = "TEST CURSES APP -"
         self.searchText = ''
-        self.stdscr = stdscr
+        self.closed = False
 
         # set screen attributes
+        self.old_tty = termios.tcgetattr(sys.stdin.fileno())
+        self.stdscr = curses.initscr()  # initialize curses
         self.stdscr.nodelay(1)  # this is used to make input calls non-blocking
         curses.cbreak()
         self.stdscr.keypad(1)
@@ -118,11 +124,12 @@ class Screen(CursesStdIO):
 
     def paintStatus(self, text):
         if len(text) > self.cols:
-            raise TextTooLongError
+            text = text[:self.cols]
         self.stdscr.addstr(self.rows - 2, 0, text + ' ' * (self.cols - len(text)),
                            curses.color_pair(1))
         # move cursor to input line
         self.stdscr.move(self.rows - 1, self.cols - 1)
+        self.stdscr.refresh()
 
     def doRead(self):
         """ Input is ready! """
@@ -157,11 +164,14 @@ class Screen(CursesStdIO):
 
     def close(self):
         """ clean up """
-
+        if self.closed:
+            return
         curses.nocbreak()
         self.stdscr.keypad(0)
         curses.echo()
         curses.endwin()
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self.old_tty)
+        self.closed = True
 
 
 def setup_logging(option_group):
@@ -192,6 +202,71 @@ def setup_logging(option_group):
     return
 
 
+def mx4j_query(hostname, objectname, attribute, operation):
+    '''Call out to MX4J, return a dictionary.
+    '''
+    url_template = 'http://{Hostname:s}:8081/{OPERATION:s}?objectname={JAVA_OBJECT:s}&attribute={ITEM:s}&operation={ITEM:s}&template=identity'
+    bean_designator = 'MBean'
+    return_value_designators = ['Attribute', '@value']
+    default_value = 0
+    operation = 'getattribute'
+    datatype = int
+    default_format = '{VALUE:>4d}'
+
+    # def __init__(self, hostname, java_object, item, *args, **kwargs):
+    #     '''Set some default values for the dictionary, largely for debugging and interpolation purposes'''
+    #     dict.__init__(self, *args, **kwargs)
+    #     self[HOSTNAME] = hostname
+    #     self[JAVA_OBJECT] = java_object
+    #     self[ITEM] = item
+    # This seems silly, but it lets subclasses override while still letting
+    # us do interpolation.
+    #     self[OPERATION] = self.operation
+    #     self[URL] = self.url_template.format(**self)
+    #     self[VALUE] = self.default_value
+    #     return None
+
+
+def no_host(*_):
+    reactor.stop()
+    print "Unable to connect to Cassandra"
+    return
+
+
+def register_hosts(xml_blob, screen):
+    open('/tmp/foo', 'w').write('1')
+    screen.paintStatus('registering hosts')
+    time.sleep(1)
+    ring_data = xmltodict.parse(xml_blob)
+    screen.paintStatus(str(ring_data))
+    time.sleep(1)
+    open('/tmp/foo', 'w').write(str(ring_data))
+    mbean = ring_data['MBean']
+    open('/tmp/foo', 'w').write(str(mbean))
+    attribute = mbean['Attribute']
+    open('/tmp/foo', 'w').write(str(attribute))
+    value = attribute['@value']
+    open('/tmp/foo', 'w').write(str(value))
+    groups = re.split('^/', value, re.MULTILINE)
+    screen.paintStatus(str(groups))
+    open('/tmp/foo', 'w').write(str(groups))
+
+
+def wHATEver(error, screen):
+    screen.paintStatus(str(error))
+    open('/tmp/wHATEver', 'w').write(str(error))
+
+
+def cluster_diviner(option_group):
+    '''Discovers the members of the cluster.  Dead cluster members are never
+    removed, but new cluster members will be added.
+    See: CursedCluster for what this should do.
+    '''
+    # http://db-cdev-1.phx3.llnw.net:8081/mbean?objectname=*:type=*&template=identity
+    # http://db-cdev-1.phx3.llnw.net:8081/getattribute?objectname=org.apache.cassandra.net:type=FailureDetector&attribute=AllEndpointStates&operation=getattribute&template=identity
+    return
+
+
 def main():
     """Primary entry point."""
     logging.debug('main')
@@ -215,12 +290,17 @@ def main():
     setup_logging(options)
 
     # Your code here.
-    old_tty = termios.tcgetattr(sys.stdin.fileno())
-    stdscr = curses.initscr()  # initialize curses
-    screen = Screen(stdscr)   # create Screen object
-    #httpFactory = HTTPFactory(screen)
+    print 'getting node list'
+    print 'setting up curses'
+    d = getPage(
+        'http://%(seed_host)s:%(mx4j_port)s/getattribute?objectname=org.apache.cassandra.net:type=FailureDetector&attribute=AllEndpointStates&operation=getattribute&template=identity' % vars(options))
+    print d
+    screen = Screen()   # create Screen object
+    d.addCallbacks(register_hosts, no_host, callbackArgs=[screen, ])
+    d.addErrback(wHATEver, screen)
     try:
         # add screen object as a reader to the reactor
+        #LoopingCall(cluster_diviner, options)
         reactor.addReader(screen)
         if options.debug:
             import twisted.manhole.telnet
@@ -233,10 +313,9 @@ def main():
         # reactor.connectTCP("irc.freenode.net",6667,ircFactory) # connect to
         # IRC
         reactor.run()  # have fun!
-    except:
-        pass
+    except Exception as e:
+        raise e
     screen.close()
-    termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, old_tty)
 
     return
 
