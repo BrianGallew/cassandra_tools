@@ -21,20 +21,15 @@ import argparse
 import sys
 import xmltodict
 import urllib2
-import optparse
-import threading
 import re
 import curses
 import time
 import socket
-import json
 import collections
-import traceback
 import signal
 import termios
 import pprint
 import types
-import collections
 
 # Yay, Twisted!
 from twisted.internet import reactor
@@ -130,9 +125,10 @@ class Screen(CursesStdIO):
     help = False
     help_indicator = " Press '?' for help"
     screen_name = 'Unknown'
+    max_sort_key = 0
+    sort_key = 0
 
     def __init__(self):
-        self.statusText = "TEST CURSES APP -"
         self.closed = False
 
         # set screen attributes
@@ -242,14 +238,14 @@ class Screen(CursesStdIO):
             if self.max_sort_key > value:
                 self.sort_key = value
             else:
-                self.sort_key = max_sort_key
+                self.sort_key = self.max_sort_key
         elif key in '<>':
             if key == '>':
                 value = self.sort_key + 1
                 if self.max_sort_key > value:
                     self.sort_key = value
                 else:
-                    self.sort_key = max_sort_key
+                    self.sort_key = self.max_sort_key
             else:
                 value = self.sort_key - 1
                 if value < 0:
@@ -281,7 +277,6 @@ def setup_logging(option_group):
     """Sets up logging in a syslog format by log level
     :param option_group: options as returned by the OptionParser
     """
-    stderr_log_format = "%(levelname) -8s %(asctime)s %(funcName)s line:%(lineno)d: %(message)s"
     file_log_format = "%(asctime)s - %(levelname)s - %(message)s"
     logger = logging.getLogger()
     if option_group.debug:
@@ -291,13 +286,11 @@ def setup_logging(option_group):
     else:
         logger.setLevel(level=logging.WARNING)
 
-    handlers = []
     if option_group.logfile:
         handler = logging.FileHandler(option_group.logfile)
         handler.setFormatter(logging.Formatter(file_log_format))
         logger.addHandler(handler)
     else:
-        facility = option_group.syslog or 'USER'
         # Use standard format here because timestamp and level will be added by
         # syslogd.
         logger.addHandler(
