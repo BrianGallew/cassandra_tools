@@ -40,6 +40,8 @@ from twisted.internet.task import LoopingCall
 from twisted.web.client import getPage
 
 endpoints = {}                  # All Cassandra endpoints
+ATTRIBUTE = 'Attribute'
+CLASSNAME = '@classname'
 
 
 class CursesStdIO:
@@ -68,6 +70,7 @@ class Screen(CursesStdIO):
     rows = 0
     cols = 0
     lines = []
+    delay = 5
 
     def __init__(self):
         self.timer = 0
@@ -82,10 +85,8 @@ class Screen(CursesStdIO):
         curses.cbreak()
         self.stdscr.keypad(1)
         curses.curs_set(0)     # no annoying mouse cursor
-
         signal.signal(signal.SIGWINCH, self.updateSize)
         self.updateSize()
-
         curses.start_color()
 
         # create color pair's 1 and 2
@@ -233,28 +234,110 @@ def no_host(*_):
     return
 
 
-def register_hosts(xml_blob, screen):
-    open('/tmp/foo', 'w').write('1')
-    screen.paintStatus('registering hosts')
-    time.sleep(1)
-    ring_data = xmltodict.parse(xml_blob)
-    screen.paintStatus(str(ring_data))
-    time.sleep(1)
-    open('/tmp/foo', 'w').write(str(ring_data))
-    mbean = ring_data['MBean']
-    open('/tmp/foo', 'w').write(str(mbean))
-    attribute = mbean['Attribute']
-    open('/tmp/foo', 'w').write(str(attribute))
-    value = attribute['@value']
-    open('/tmp/foo', 'w').write(str(value))
-    groups = re.split('^/', value, re.MULTILINE)
-    screen.paintStatus(str(groups))
-    open('/tmp/foo', 'w').write(str(groups))
+def register_hosts(option_group):
+    '''Sets up the global list of hosts.
+    '''
+    url = 'http://%(seed_host)s:%(mx4j_port)s/getattribute?objectname=org.apache.cassandra.net:type=FailureDetector&attribute=AllEndpointStates&operation=getattribute&template=identity' % vars(
+        option_group)
+    ring_data = xmltodict.parse(urllib2.urlopen(url, None, 30))
+    value = ring_data['MBean']['Attribute']['@value']
+    for row in re.split('^/', value, flags=re.MULTILINE):
+        if not row:
+            continue
+        if 'STATUS:remov' in row:
+            continue
+        row_pieces = row.split('\n  ')
+        complete_address_set = socket.gethostbyaddr(row_pieces[0])
+        endpoint = complete_address_set[0].replace('.cint', '')
+        endpoints[endpoint] = complete_address_set
 
 
-def wHATEver(error, screen):
-    screen.paintStatus(str(error))
-    open('/tmp/wHATEver', 'w').write(str(error))
+def schedule_cluster(option_group):
+    '''Schedule calls of all cluster data'''
+    deferreds = []
+    for endpoint in endpoints:
+        deferreds.append(getPage(
+            'http://%s:%s/mbean?objectname=*:type=*&template=identity' % (endpoint, option_group.mx4j_port)))
+        deferreds[-1].addCallback(parse_data)
+        deferreds[-1].addCallback(update_data, endpoint)
+        return deferreds[-1]
+    return deferreds
+
+
+def type_convertor(data_type, data_value):
+    '''Convert Java types into Python types.  This is incomplete, but meh.
+    '''
+    try:
+        if data_type == 'java.lang.String' or data_type == '[Ljava.lang.String':
+            return data_value
+        elif data_type == 'boolean':
+            if data_value == 'true':
+                return True
+            else:
+                return False
+        elif data_type == 'int' or data_type == 'long' or data_type == 'java.lang.Long':
+            return int(data_value)
+        elif data_type == 'float' or data_type == 'double':
+            return float(data_value)
+        elif data_type == 'java.util.List' or data_type == 'java.util.Set':
+            return [x.strip() for x in data_value[1:-1].split(',')]
+        elif data_type == 'java.util.Map':
+            map_value = {}
+            for line in data_value[1:-1].split(','):
+                x, y = line.split('=')
+                map_value[x.strip()] = y.strip()
+            return map_value
+        else:
+            # I don't care about any of the remaining types at this
+            # point.  I hope.
+            logging.info('Unknown type: %s:%s', data_type, data_value)
+    except Exception as e:
+        logging.info(
+            'Exception processing: %s:%s (%s)', data_type, data_value, e)
+    return None
+
+
+def parse_data(xml_blob):
+    data = xmltodict.parse(xml_blob)['Server']['MBean']
+    converted_data = {}
+    for bean in data:
+        label = bean[CLASSNAME]
+        if label in ['org.apache.cassandra.db.BatchlogManager', 'org.apache.cassandra.locator.EndpointSnitchInfo']:
+            try:
+                converted_data.setdefault(
+                    label, {})[bean[ATTRIBUTE]['@name']] = bean[ATTRIBUTE]['@value']
+            except:
+                logging.warning('BEGIN %s\n%s\nEND %s', label, bean,  label)
+            continue
+        if '@name' in bean and bean['@name'] == 'SchemaVersions':
+            converted_data['SchemaVersions'] = bean['@value']
+            continue
+        converted_data[label] = {}
+        if not ATTRIBUTE in bean:
+            if not 'Operation' in bean:
+                logging.info('STUPIDITY: %s' % str(bean))
+            continue
+        for data_item in bean[ATTRIBUTE]:
+            converted_data[label][data_item['@name']] = type_convertor(
+                data_item['@type'], data_item['@value'])
+            logging.debug(
+                '%s:%s', label, converted_data[label][data_item['@name']])
+    return converted_data
+
+
+def update_data(datadict, endpoint):
+    logging.debug('%s: %s', endpoint, pprint.pformat(datadict))
+    # There are a few odd types in the master data that need to be updated
+    # intelligently rather than just being blindly overwritten.
+    # READ_LATENCY_INSTANTANEOUS:
+    #     (CursedLatencyAverage,
+    #      ('org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency', '75thPercentile')),
+    # WRITE_LATENCY_INSTANTANEOUS:
+    #     (CursedLatencyAverage,
+    #      ('org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency', '75thPercentile')),
+    # self.compaction_averages.add(compaction_data)
+
+    return
 
 
 def cluster_diviner(option_group):
@@ -267,9 +350,9 @@ def cluster_diviner(option_group):
     return
 
 
-def main():
-    """Primary entry point."""
-    logging.debug('main')
+def cli():
+    '''Put argument selection/parsing in here for neatness
+    '''
     parser = argparse.ArgumentParser()
     # Standard logging options.
     parser.add_argument("-v", "--verbose", dest="verbose", action='store_true',
@@ -288,19 +371,21 @@ def main():
 
     options = parser.parse_args()
     setup_logging(options)
+    return options
+
+
+def main():
+    """Primary entry point."""
+    options = cli()
 
     # Your code here.
     print 'getting node list'
-    print 'setting up curses'
-    d = getPage(
-        'http://%(seed_host)s:%(mx4j_port)s/getattribute?objectname=org.apache.cassandra.net:type=FailureDetector&attribute=AllEndpointStates&operation=getattribute&template=identity' % vars(options))
-    print d
+    register_hosts(options)
     screen = Screen()   # create Screen object
-    d.addCallbacks(register_hosts, no_host, callbackArgs=[screen, ])
-    d.addErrback(wHATEver, screen)
     try:
         # add screen object as a reader to the reactor
-        #LoopingCall(cluster_diviner, options)
+        lc = LoopingCall(schedule_cluster, options)
+        lc.start(screen.delay)
         reactor.addReader(screen)
         if options.debug:
             import twisted.manhole.telnet
