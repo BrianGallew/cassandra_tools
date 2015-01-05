@@ -203,37 +203,6 @@ def setup_logging(option_group):
     return
 
 
-def mx4j_query(hostname, objectname, attribute, operation):
-    '''Call out to MX4J, return a dictionary.
-    '''
-    url_template = 'http://{Hostname:s}:8081/{OPERATION:s}?objectname={JAVA_OBJECT:s}&attribute={ITEM:s}&operation={ITEM:s}&template=identity'
-    bean_designator = 'MBean'
-    return_value_designators = ['Attribute', '@value']
-    default_value = 0
-    operation = 'getattribute'
-    datatype = int
-    default_format = '{VALUE:>4d}'
-
-    # def __init__(self, hostname, java_object, item, *args, **kwargs):
-    #     '''Set some default values for the dictionary, largely for debugging and interpolation purposes'''
-    #     dict.__init__(self, *args, **kwargs)
-    #     self[HOSTNAME] = hostname
-    #     self[JAVA_OBJECT] = java_object
-    #     self[ITEM] = item
-    # This seems silly, but it lets subclasses override while still letting
-    # us do interpolation.
-    #     self[OPERATION] = self.operation
-    #     self[URL] = self.url_template.format(**self)
-    #     self[VALUE] = self.default_value
-    #     return None
-
-
-def no_host(*_):
-    reactor.stop()
-    print "Unable to connect to Cassandra"
-    return
-
-
 def register_hosts(option_group):
     '''Sets up the global list of hosts.
     '''
@@ -337,16 +306,6 @@ def update_data(datadict, endpoint):
     #      ('org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency', '75thPercentile')),
     # self.compaction_averages.add(compaction_data)
 
-    return
-
-
-def cluster_diviner(option_group):
-    '''Discovers the members of the cluster.  Dead cluster members are never
-    removed, but new cluster members will be added.
-    See: CursedCluster for what this should do.
-    '''
-    # http://db-cdev-1.phx3.llnw.net:8081/mbean?objectname=*:type=*&template=identity
-    # http://db-cdev-1.phx3.llnw.net:8081/getattribute?objectname=org.apache.cassandra.net:type=FailureDetector&attribute=AllEndpointStates&operation=getattribute&template=identity
     return
 
 
