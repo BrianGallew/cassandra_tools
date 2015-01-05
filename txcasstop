@@ -33,15 +33,68 @@ import traceback
 import signal
 import termios
 import pprint
+import types
+import collections
 
 # Yay, Twisted!
 from twisted.internet import reactor
 from twisted.internet.task import LoopingCall
 from twisted.web.client import getPage
+from twisted.internet.error import ReactorNotRunning
 
+# Globals are bad and I should be ashamed.  But they're so *useful*!
 endpoints = {}                  # All Cassandra endpoints
+start_time = 0.0
+end_time = 0.0
 ATTRIBUTE = 'Attribute'
 CLASSNAME = '@classname'
+
+
+class MovingAverages(object):
+
+    '''Handle moving averages as often displayed by programs like top(8).'''
+
+    def __init__(self):
+        self.queue = collections.deque()  # Where we keep our data stashed away
+        self.one = self.five = self.fifteen = 0.0
+        return
+
+    def add(self, value):
+        '''Add a new value, timestamped appropriately.  Throw away any old
+        values, then re-compute the moving averages.'''
+        now = time.time()
+        self.queue.appendleft((value, now))
+        # These two lines discard old stuff
+        old = now - 900         # 15 minutes
+        while self.queue and self.queue[-1][1] < old:
+            del self.queue[-1]
+        total = 0.0
+        count = 0
+
+        then = now - 60
+        while count < len(self.queue):
+            value, timestamp = self.queue[count]
+            if timestamp < then:
+                break
+            count += 1
+            total += value
+        self.one = total / count
+
+        then = now - 300
+        while count < len(self.queue):
+            value, timestamp = self.queue[count]
+            if timestamp < then:
+                break
+            count += 1
+            total += value
+        self.five = total / count
+
+        while count < len(self.queue):
+            value, timestamp = self.queue[count]
+            count += 1
+            total += value
+        self.fifteen = total / count
+        return self
 
 
 class CursesStdIO:
@@ -71,11 +124,15 @@ class Screen(CursesStdIO):
     cols = 0
     lines = []
     delay = 5
+    header_data = {}
+    screen_data = {}
+    ring_name = ''
+    help = False
+    help_indicator = " Press '?' for help"
+    screen_name = 'Unknown'
 
     def __init__(self):
-        self.timer = 0
         self.statusText = "TEST CURSES APP -"
-        self.searchText = ''
         self.closed = False
 
         # set screen attributes
@@ -91,13 +148,19 @@ class Screen(CursesStdIO):
 
         # create color pair's 1 and 2
         curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
-        curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)
+        curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
 
-        self.paintStatus(self.statusText)
+        self.paintStatus()
         self.stdscr.refresh()
 
     def updateSize(self, *_):
+        curses.endwin()
+        curses.initscr()
         self.rows, self.cols = self.stdscr.getmaxyx()
+        if self.cols < 80:
+            raise Exception('At least 80 columns required for display')
+        logging.info('Updated screen size to (%d,%d)' %
+                     (self.rows, self.cols))
 
     def connectionLost(self, reason):
         self.close()
@@ -113,7 +176,7 @@ class Screen(CursesStdIO):
             based on internal list of lines """
 
         self.stdscr.clear()
-        self.paintStatus(self.statusText)
+        self.paintStatus()
         i = 0
         index = len(self.lines) - 1
         while i < (self.rows - 3) and index >= 0:
@@ -123,44 +186,79 @@ class Screen(CursesStdIO):
             index = index - 1
         self.stdscr.refresh()
 
-    def paintStatus(self, text):
-        if len(text) > self.cols:
-            text = text[:self.cols]
-        self.stdscr.addstr(self.rows - 2, 0, text + ' ' * (self.cols - len(text)),
-                           curses.color_pair(1))
+    def paintStatus(self):
+
+        status_message = 'Update frequency: %ds (%0.2f)' % (
+            self.delay, end_time - start_time)
+        status_message = status_message[:self.cols]
+        len_status_message = len(status_message)
+        len_screen_name = len(self.screen_name)
+        len_help_indicator = len(self.help_indicator)
+        total_len = len_status_message + \
+            len_screen_name + len_help_indicator + 1
+        if total_len < self.cols:
+            self.stdscr.addstr(
+                self.rows - 1, 0, status_message + ' ' * (self.cols - total_len), curses.color_pair(1))
+            self.stdscr.addstr(self.screen_name, curses.color_pair(2))
+            self.stdscr.addstr(self.help_indicator, curses.color_pair(1))
+        else:
+            self.stdscr.addstr(
+                self.rows - 1, 0, status_message, curses.color_pair(1))
         # move cursor to input line
-        self.stdscr.move(self.rows - 1, self.cols - 1)
         self.stdscr.refresh()
+
+    def reload_data(self):
+        '''Re-load all cumulative data.'''
+        if not endpoints:
+            return  # First run
+        if not self.ring_name:
+            key = endpoints.keys()[0]
+            self.ring_name = endpoints[key].get(
+                'org.apache.cassandra.db:type=StorageService', {}).get('ClusterName', '')
+        self.paintStatus()
+        pass
 
     def doRead(self):
         """ Input is ready! """
         curses.noecho()
-        self.timer = self.timer + 1
-        c = self.stdscr.getch()  # read a character
-
-        if c == curses.KEY_BACKSPACE:
-            self.searchText = self.searchText[:-1]
-
-        elif c == curses.KEY_ENTER or c == 10:
-            self.addLine(self.searchText)
-            # for testing too
-            try:
-                self.irc.sendLine(self.searchText)
-            except:
-                pass
-            self.stdscr.refresh()
-            self.searchText = ''
-
-        else:
-            if len(self.searchText) == self.cols - 2:
-                return
-            self.searchText = self.searchText + chr(c)
-
-        self.stdscr.addstr(self.rows - 1, 0,
-                           self.searchText + (' ' * (
-                               self.cols - len(self.searchText) - 2)))
-        self.stdscr.move(self.rows - 1, len(self.searchText))
-        self.paintStatus(self.statusText + ' %d' % len(self.searchText))
+        key = chr(self.stdscr.getch())  # read a character
+        logging.debug('read %s', key)
+        if self.help:
+            self.help = False
+            return self.reload_data()
+        if key in 'qQ':
+            logging.debug('quitting by user request')
+            self.close()
+            return
+        elif key == '+':
+            self.delay += 1
+        elif key == '-':
+            if self.delay > 1:
+                self.delay -= 1
+        elif key in 'chslrw':
+            self.change_layout(key)
+        elif key in '1234567890':
+            value = (int(key) - 1 + 10) % 10  # Convert to [0..9]
+            if self.max_sort_key > value:
+                self.sort_key = value
+            else:
+                self.sort_key = max_sort_key
+        elif key in '<>':
+            if key == '>':
+                value = self.sort_key + 1
+                if self.max_sort_key > value:
+                    self.sort_key = value
+                else:
+                    self.sort_key = max_sort_key
+            else:
+                value = self.sort_key - 1
+                if value < 0:
+                    value = 0
+                self.sort_key = value
+        elif key == '?':
+            self.help = True
+            return self.display_help()
+        self.paintStatus()
         self.stdscr.refresh()
 
     def close(self):
@@ -173,6 +271,10 @@ class Screen(CursesStdIO):
         curses.endwin()
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self.old_tty)
         self.closed = True
+        try:
+            reactor.stop()
+        except ReactorNotRunning:
+            pass
 
 
 def setup_logging(option_group):
@@ -218,24 +320,35 @@ def register_hosts(option_group):
         row_pieces = row.split('\n  ')
         complete_address_set = socket.gethostbyaddr(row_pieces[0])
         endpoint = complete_address_set[0].replace('.cint', '')
-        endpoints[endpoint] = complete_address_set
+        endpoints[endpoint] = {}
 
 
-def schedule_cluster(option_group):
+def schedule_cluster(option_group, screen):
     '''Schedule calls of all cluster data'''
+    # First, update the cluster display to the current state.
+    global start_time
+    screen.reload_data()
+    start_time = time.time()
+    # Now, set up Deferreds for all of the URLs that need to be gotten.
     deferreds = []
     for endpoint in endpoints:
-        deferreds.append(getPage(
-            'http://%s:%s/mbean?objectname=*:type=*&template=identity' % (endpoint, option_group.mx4j_port)))
-        deferreds[-1].addCallback(parse_data)
-        deferreds[-1].addCallback(update_data, endpoint)
-        return deferreds[-1]
+        url = 'http://%s:%s/mbean?template=identity&operations=false&constructors=false&notifications=false&' % (
+            endpoint, option_group.mx4j_port)
+        for query in [
+                'objectname=org.apache.cassandra.metrics:type=ClientRequest,scope=*,name=*',
+                'objectname=*:type=*'
+        ]:
+            deferreds.append(getPage(url + query))
+            deferreds[-1].addCallback(parse_data)
+            deferreds[-1].addCallback(update_data, endpoint)
     return deferreds
 
 
 def type_convertor(data_type, data_value):
     '''Convert Java types into Python types.  This is incomplete, but meh.
     '''
+    if 'Write-only' in data_value:
+        return None
     try:
         if data_type == 'java.lang.String' or data_type == '[Ljava.lang.String':
             return data_value
@@ -267,45 +380,69 @@ def type_convertor(data_type, data_value):
 
 
 def parse_data(xml_blob):
+    global end_time
     data = xmltodict.parse(xml_blob)['Server']['MBean']
     converted_data = {}
     for bean in data:
-        label = bean[CLASSNAME]
-        if label in ['org.apache.cassandra.db.BatchlogManager', 'org.apache.cassandra.locator.EndpointSnitchInfo']:
-            try:
-                converted_data.setdefault(
-                    label, {})[bean[ATTRIBUTE]['@name']] = bean[ATTRIBUTE]['@value']
-            except:
-                logging.warning('BEGIN %s\n%s\nEND %s', label, bean,  label)
+        if not ATTRIBUTE in bean:
+            # Some mbeans don't have attributes (e.g.
+            # org.apache.cassandra.net:type=Gossiper)
             continue
+        label = bean['@objectname']
+        # SchemaVersions is ... special.
         if '@name' in bean and bean['@name'] == 'SchemaVersions':
             converted_data['SchemaVersions'] = bean['@value']
             continue
         converted_data[label] = {}
-        if not ATTRIBUTE in bean:
-            if not 'Operation' in bean:
-                logging.info('STUPIDITY: %s' % str(bean))
-            continue
-        for data_item in bean[ATTRIBUTE]:
-            converted_data[label][data_item['@name']] = type_convertor(
-                data_item['@type'], data_item['@value'])
-            logging.debug(
-                '%s:%s', label, converted_data[label][data_item['@name']])
+        a_type = type(bean[ATTRIBUTE])
+        if a_type == types.ListType:
+            for data_item in bean[ATTRIBUTE]:
+                try:
+                    converted_data[label][data_item['@name']] = type_convertor(
+                        data_item['@type'], data_item['@value'])
+                    logging.debug(
+                        '%s:%s', label, converted_data[label][data_item['@name']])
+                except:
+                    logging.warn(
+                        'Error converting %s:%s', bean['@objectname'], data_item)
+        elif a_type == collections.OrderedDict:
+            data_item = bean[ATTRIBUTE]
+            try:
+                converted_data[label][data_item['@name']] = type_convertor(
+                    data_item['@type'], data_item['@value'])
+                logging.debug(
+                    '%s:%s', label, converted_data[label][data_item['@name']])
+            except:
+                logging.warn(
+                    'Error converting %s:%s', bean['@objectname'], data_item)
+        else:
+            logging.critical(
+                'No handler for %s: type %s/%s', str(bean), a_type, collections.OrderedDict)
+    end_time = time.time()
     return converted_data
 
 
 def update_data(datadict, endpoint):
-    logging.debug('%s: %s', endpoint, pprint.pformat(datadict))
     # There are a few odd types in the master data that need to be updated
     # intelligently rather than just being blindly overwritten.
-    # READ_LATENCY_INSTANTANEOUS:
-    #     (CursedLatencyAverage,
-    #      ('org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency', '75thPercentile')),
-    # WRITE_LATENCY_INSTANTANEOUS:
-    #     (CursedLatencyAverage,
-    #      ('org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency', '75thPercentile')),
-    # self.compaction_averages.add(compaction_data)
-
+    for objectclass, attribute in [
+            ['org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency',
+                '75thPercentile'],
+            ['org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency',
+                '75thPercentile'],
+            ['org.apache.cassandra.metrics:type=ClientRequest,scope=RangeSlice,name=Latency',
+                '75thPercentile'],
+            ['org.apache.cassandra.db:type=DynamicEndpointSnitch', 'Severity']
+    ]:
+        if objectclass in datadict:
+            try:
+                ma = endpoints[endpoint][objectclass][attribute]
+            except:
+                ma = MovingAverages()
+            ma.add(datadict[objectclass][attribute])
+            datadict[objectclass][attribute] = ma
+    endpoints[endpoint].update(datadict)
+    logging.debug('%s: %s', endpoint, pprint.pformat(endpoints[endpoint]))
     return
 
 
@@ -343,7 +480,7 @@ def main():
     screen = Screen()   # create Screen object
     try:
         # add screen object as a reader to the reactor
-        lc = LoopingCall(schedule_cluster, options)
+        lc = LoopingCall(schedule_cluster, options, screen)
         lc.start(screen.delay)
         reactor.addReader(screen)
         if options.debug:
@@ -359,7 +496,7 @@ def main():
         reactor.run()  # have fun!
     except Exception as e:
         raise e
-    screen.close()
+    screen.close()              # Just in case!
 
     return
 
