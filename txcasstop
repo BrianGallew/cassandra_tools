@@ -30,6 +30,7 @@ import signal
 import termios
 import pprint
 import types
+from log_exceptions import log_exceptions  # Debugging tool
 
 # Yay, Twisted!
 from twisted.internet import reactor
@@ -127,6 +128,29 @@ class Screen(CursesStdIO):
     screen_name = 'Unknown'
     max_sort_key = 0
     sort_key = 0
+    helpstrings = [
+        ('',
+         'Summary information in the first couple lines is for the entire cluster.'),
+        ('', ''),
+        ('q', 'Exit the program (immediately)'),
+        ('c', 'Display cluster summary data'),
+        ('h', 'Display host data'),
+        ('s', 'Display severity (compaction) data'),
+        ('l', 'Display load data'),
+        ('r', 'Display read data'),
+        ('w', 'Display write data'),
+        ('', ''),
+        ('+',
+         'Increase the delay between updates (takes effect after next update)'),
+        ('-',
+         'Decrease the delay between updates (takes effect after next update)'),
+        ('', ''),
+        ('1-9', 'Column to sort on, OR switch values sets in read/write data'),
+        ('<>',
+         'Previous/next sort column, OR switch values sets in read/write data'),
+        ('', ''),
+        ('?', 'This help screen'),
+    ]
 
     def __init__(self):
         self.closed = False
@@ -214,14 +238,35 @@ class Screen(CursesStdIO):
         self.paintStatus()
         pass
 
+    @log_exceptions()
+    def display_help(self):
+        helpscr = self.stdscr.subwin(self.rows - 4, self.cols - 4, 2, 2)
+        (RESTY, RESTX) = helpscr.getmaxyx()
+        helpscr.clrtobot()
+        helpscr.box()
+        y = 1
+        for parts in self.helpstrings:
+            y += 1
+            helpscr.addnstr(y, 3, '%s: %s' % parts, RESTX - 4)
+        helpscr.addstr(RESTY - 1, 3, 'Press any key to leave help')
+        helpscr.refresh()
+        self.help = helpscr
+
+    @log_exceptions()
     def doRead(self):
         """ Input is ready! """
         curses.noecho()
-        key = chr(self.stdscr.getch())  # read a character
+        key = self.stdscr.getch()  # read a character
+        if key > 255:
+            return       # We don't really handle special keys
+        key = chr(key)   # make it an actual character
         logging.debug('read %s', key)
         if self.help:
+            self.help.erase()
             self.help = False
-            return self.reload_data()
+            self.stdscr.refresh()
+            # return self.reload_data()
+            return
         if key in 'qQ':
             logging.debug('quitting by user request')
             self.close()
@@ -252,7 +297,6 @@ class Screen(CursesStdIO):
                     value = 0
                 self.sort_key = value
         elif key == '?':
-            self.help = True
             return self.display_help()
         self.paintStatus()
         self.stdscr.refresh()
@@ -316,6 +360,7 @@ def register_hosts(option_group):
         endpoints[endpoint] = {}
 
 
+@log_exceptions()
 def schedule_cluster(option_group, screen):
     '''Schedule calls of all cluster data'''
     # First, update the cluster display to the current state.
@@ -331,6 +376,7 @@ def schedule_cluster(option_group, screen):
                 'objectname=org.apache.cassandra.metrics:type=ClientRequest,scope=*,name=*',
                 'objectname=*:type=*'
         ]:
+            logging.debug('dispatching GET for %s', url + query)
             deferreds.append(getPage(url + query))
             deferreds[-1].addCallback(parse_data)
             deferreds[-1].addCallback(update_data, endpoint)
@@ -372,6 +418,7 @@ def type_convertor(data_type, data_value):
     return None
 
 
+@log_exceptions()
 def parse_data(xml_blob):
     global end_time
     data = xmltodict.parse(xml_blob)['Server']['MBean']
@@ -410,7 +457,7 @@ def parse_data(xml_blob):
                     'Error converting %s:%s', bean['@objectname'], data_item)
         else:
             logging.critical(
-                'No handler for %s: type %s/%s', str(bean), a_type, collections.OrderedDict)
+                'No handler for %s: type %s', str(bean), a_type)
     end_time = time.time()
     return converted_data
 
