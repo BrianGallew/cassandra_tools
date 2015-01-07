@@ -150,10 +150,11 @@ class Screen(CursesStdIO):
     sort_key = 0
     functions = {}
     cluster_compaction_averages = MovingAverages()
+    closed = False
 
     def __init__(self):
-        self.closed = False
-
+        '''Initialize Curses and do the first screen painting.
+        '''
         # set screen attributes
         self.old_tty = termios.tcgetattr(sys.stdin.fileno())
         self.stdscr = curses.initscr()  # initialize curses
@@ -189,6 +190,10 @@ class Screen(CursesStdIO):
         return
 
     def connectionLost(self, _):
+        '''Standard twisted-required function to handle lost "connections" It
+        should only ever be used in the event that stdin gets closed.
+
+        '''
         self.close()
 
     def paintHeader(self):
