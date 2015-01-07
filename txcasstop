@@ -46,6 +46,25 @@ ATTRIBUTE = 'Attribute'
 CLASSNAME = '@classname'
 
 
+def add_summary(functions, key, summary):
+    '''Decorator to be used on the various methods in the Screen class which
+    are to be exposed via help.
+    :param functions: Dict to be updated
+    :param key: Keystroke to invoke the method
+    :param summary: Help screen text for this method
+    :returns: decorator which does the actual update
+
+    I suppose if I were more clever I'd make this a class function, but I
+    think it's actually more appropriate to put this out here.
+
+    '''
+    def real_decorator(func):
+        functions[key] = func
+        func.summary = summary
+        return func
+    return real_decorator
+
+
 class MovingAverages(object):
 
     '''Handle moving averages as often displayed by programs like top(8).'''
@@ -125,32 +144,10 @@ class Screen(CursesStdIO):
     ring_name = ''
     help = False
     help_indicator = " Press '?' for help"
-    screen_name = 'Unknown'
     max_sort_key = 0
     sort_key = 0
-    helpstrings = [
-        ('',
-         'Summary information in the first couple lines is for the entire cluster.'),
-        ('', ''),
-        ('q', 'Exit the program (immediately)'),
-        ('c', 'Display cluster summary data'),
-        ('h', 'Display host data'),
-        ('s', 'Display severity (compaction) data'),
-        ('l', 'Display load data'),
-        ('r', 'Display read data'),
-        ('w', 'Display write data'),
-        ('', ''),
-        ('+',
-         'Increase the delay between updates (takes effect after next update)'),
-        ('-',
-         'Decrease the delay between updates (takes effect after next update)'),
-        ('', ''),
-        ('1-9', 'Column to sort on, OR switch values sets in read/write data'),
-        ('<>',
-         'Previous/next sort column, OR switch values sets in read/write data'),
-        ('', ''),
-        ('?', 'This help screen'),
-    ]
+    functions = {}
+    cluster_compaction_averages = MovingAverages()
 
     def __init__(self):
         self.closed = False
@@ -163,68 +160,90 @@ class Screen(CursesStdIO):
         self.stdscr.keypad(1)
         curses.curs_set(0)     # no annoying mouse cursor
         signal.signal(signal.SIGWINCH, self.updateSize)
-        self.updateSize()
-        curses.start_color()
 
         # create color pair's 1 and 2
+        curses.start_color()
         curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
         curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
 
+        self.updateSize()
         self.paintStatus()
         self.stdscr.refresh()
 
     def updateSize(self, *_):
+        '''SIGWINCH handler'''
         curses.endwin()
         curses.initscr()
         self.rows, self.cols = self.stdscr.getmaxyx()
-        if self.cols < 80:
-            raise Exception('At least 80 columns required for display')
-        logging.info('Updated screen size to (%d,%d)' %
-                     (self.rows, self.cols))
+        logging.info('Updated screen size to (%d,%d)',
+                     self.rows, self.cols)
+        self.stdscr.erase()
+        if self.help:
+            self.display_help()
+        else:
+            # This should draw all the other parts
+            self.paintStatus()
+        self.stdscr.refresh()
+        return
 
-    def connectionLost(self, reason):
+    def connectionLost(self, _):
         self.close()
 
-    def addLine(self, text):
-        """ add a line to the internal list of lines"""
+    def paintHeader(self):
+        if not self.header_data:
+            return  # No data!
 
-        self.lines.append(text)
-        self.redisplayLines()
+    @add_summary(functions, 'c', 'Cluster Summary')
+    def paintClusterRollup(self):
+        'Display cluster summary data'
+        pass
+    current_function = paintClusterRollup
 
-    def redisplayLines(self):
-        """ method for redisplaying lines 
-            based on internal list of lines """
+    @add_summary(functions, 'h', 'Host Data')
+    def paintHostData(self):
+        'Display host data'
+        pass
 
-        self.stdscr.clear()
-        self.paintStatus()
-        i = 0
-        index = len(self.lines) - 1
-        while i < (self.rows - 3) and index >= 0:
-            self.stdscr.addstr(self.rows - 3 - i, 0, self.lines[index],
-                               curses.color_pair(2))
-            i = i + 1
-            index = index - 1
-        self.stdscr.refresh()
+    @add_summary(functions, 's', 'Severity')
+    def paintCompactionData(self):
+        'Display severity (compaction) data'
+        pass
 
+    @add_summary(functions, 'l', 'Load')
+    def paintLoadDistribution(self):
+        'Display load data'
+        pass
+
+    @add_summary(functions, 'r', 'Reads')
+    def paintReadStatistics(self):
+        'Display read data'
+        pass
+
+    @add_summary(functions, 'w', 'Writes')
+    def paintWriteStatistics(self):
+        'Display write data'
+        pass
+
+    @log_exceptions()
     def paintStatus(self):
-
+        '''Paint the status line at the bottom of the screen.
+        Refresh schedule/time, current display mode, and help prompt.
+        '''
+        row = self.rows - 1
         status_message = 'Update frequency: %ds (%0.2f)' % (
             self.delay, end_time - start_time)
         status_message = status_message[:self.cols]
         len_status_message = len(status_message)
-        len_screen_name = len(self.screen_name)
+        self.stdscr.addstr(
+            row, 0, status_message + ' ' * (self.cols - len_status_message - 1), curses.color_pair(1))
+        len_screen_name = len(self.current_function.summary)
         len_help_indicator = len(self.help_indicator)
-        total_len = len_status_message + \
-            len_screen_name + len_help_indicator + 1
+        total_len = len_screen_name + len_help_indicator + 1
         if total_len < self.cols:
-            self.stdscr.addstr(
-                self.rows - 1, 0, status_message + ' ' * (self.cols - total_len), curses.color_pair(1))
-            self.stdscr.addstr(self.screen_name, curses.color_pair(2))
-            self.stdscr.addstr(self.help_indicator, curses.color_pair(1))
-        else:
-            self.stdscr.addstr(
-                self.rows - 1, 0, status_message, curses.color_pair(1))
-        # move cursor to input line
+            self.stdscr.addstr(row, self.cols - len_screen_name -
+                               len_help_indicator - 1, self.current_function.summary, curses.color_pair(2))
+        self.stdscr.addstr(
+            row, self.cols - len_help_indicator - 1, self.help_indicator, curses.color_pair(1))
         self.stdscr.refresh()
 
     def reload_data(self):
@@ -240,14 +259,41 @@ class Screen(CursesStdIO):
 
     @log_exceptions()
     def display_help(self):
+        '''Draw the help page.  Try to keep the helpstrings up to date and meaningfull.
+        '''
+        offset = 4
         helpscr = self.stdscr.subwin(self.rows - 4, self.cols - 4, 2, 2)
         (RESTY, RESTX) = helpscr.getmaxyx()
         helpscr.clrtobot()
         helpscr.box()
+
+        def helpscr_addnstr(y, msg):
+            if not RESTY > y + 1:
+                return False
+            helpscr.addnstr(y, (offset / 2) + 1, msg, RESTX - offset)
+            return True
+
         y = 1
-        for parts in self.helpstrings:
+        for msg in [
+                'Summary information in the first couple lines is for the entire cluster.',
+                '',
+                'qQ  : Exit the program (immediately)',
+                '?   : This help screen',
+                '',
+                '+   : Increase the delay between updates (takes effect after next update)',
+                '-   : Decrease the delay between updates (takes effect after next update)',
+                '',
+                '1-9 : Column to sort on (if applicable)',
+                '<>  : Sort on previous/next column (if applicable)',
+                '']:
             y += 1
-            helpscr.addnstr(y, 3, '%s: %s' % parts, RESTX - 4)
+            if not helpscr_addnstr(y, msg):
+                break
+        y += 1
+        for key in sorted(self.functions):
+            y += 1
+            if not helpscr_addnstr(y, '%s   : %s' % (key, self.functions[key].__doc__)):
+                break
         helpscr.addstr(RESTY - 1, 3, 'Press any key to leave help')
         helpscr.refresh()
         self.help = helpscr
@@ -276,8 +322,9 @@ class Screen(CursesStdIO):
         elif key == '-':
             if self.delay > 1:
                 self.delay -= 1
-        elif key in 'chslrw':
-            self.change_layout(key)
+        elif key in self.functions:  # This is managed by a decorator
+            self.current_function = self.functions[key]
+            self.current_function()
         elif key in '1234567890':
             value = (int(key) - 1 + 10) % 10  # Convert to [0..9]
             if self.max_sort_key > value:
@@ -388,26 +435,28 @@ def type_convertor(data_type, data_value):
     '''
     if 'Write-only' in data_value:
         return None
+    retval = None
     try:
         if data_type == 'java.lang.String' or data_type == '[Ljava.lang.String':
-            return data_value
+            retval = data_value
         elif data_type == 'boolean':
             if data_value == 'true':
-                return True
+                retval = True
             else:
-                return False
+                retval = False
         elif data_type == 'int' or data_type == 'long' or data_type == 'java.lang.Long':
-            return int(data_value)
+            retval = int(data_value)
         elif data_type == 'float' or data_type == 'double':
-            return float(data_value)
+            retvale = float(data_value)
         elif data_type == 'java.util.List' or data_type == 'java.util.Set':
-            return [x.strip() for x in data_value[1:-1].split(',')]
+            retval = [x.strip() for x in data_value[1:-1].split(',')]
         elif data_type == 'java.util.Map':
             map_value = {}
             for line in data_value[1:-1].split(','):
                 x, y = line.split('=')
                 map_value[x.strip()] = y.strip()
-            return map_value
+            # Do the assignment last in case of an exception
+            retval = map_value
         else:
             # I don't care about any of the remaining types at this
             # point.  I hope.
@@ -415,7 +464,7 @@ def type_convertor(data_type, data_value):
     except Exception as e:
         logging.info(
             'Exception processing: %s:%s (%s)', data_type, data_value, e)
-    return None
+    return retval
 
 
 @log_exceptions()
@@ -476,11 +525,11 @@ def update_data(datadict, endpoint):
     ]:
         if objectclass in datadict:
             try:
-                ma = endpoints[endpoint][objectclass][attribute]
+                average = endpoints[endpoint][objectclass][attribute]
             except:
-                ma = MovingAverages()
-            ma.add(datadict[objectclass][attribute])
-            datadict[objectclass][attribute] = ma
+                average = MovingAverages()
+            average.add(datadict[objectclass][attribute])
+            datadict[objectclass][attribute] = average
     endpoints[endpoint].update(datadict)
     logging.debug('%s: %s', endpoint, pprint.pformat(endpoints[endpoint]))
     return
