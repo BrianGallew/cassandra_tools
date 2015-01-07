@@ -59,6 +59,7 @@ def add_summary(functions, key, summary):
 
     '''
     def real_decorator(func):
+        '''Update the  dictionary.'''
         functions[key] = func
         func.summary = summary
         return func
@@ -113,33 +114,18 @@ class MovingAverages(object):
         self.fifteen = total / count
         return self
 
-
-class CursesStdIO:
-
-    """fake fd to be registered as a reader with the twisted reactor.
-       Curses classes needing input should extend this
-
-    Taken directly from https://twistedmatrix.com/documents/14.0.0/_downloads/cursesclient.py
-    """
-
-    def fileno(self):
-        """ We want to select on FD 0 """
-        return 0
-
-    def doRead(self):
-        """called when input is ready"""
-
-    def logPrefix(self):
-        return 'CursesClient'
+    def get_all(self):
+        '''Return all three averages
+        '''
+        return self.one, self.five, self.fifteen
 
 
-class Screen(CursesStdIO):
+class Screen(object):
 
     '''Based on https://twistedmatrix.com/documents/14.0.0/_downloads/cursesclient.py
     '''
     rows = 0
     cols = 0
-    lines = []
     delay = 5
     header_data = {}
     screen_data = {}
@@ -173,6 +159,15 @@ class Screen(CursesStdIO):
         self.paintStatus()
         self.stdscr.refresh()
 
+    def fileno(self):
+        """ Mandatory twisted function so polling on FD 0 works """
+        return 0
+
+    def logPrefix(self):
+        '''Prefix added to twisted logging functions
+        '''
+        return 'CursesClient'
+
     def updateSize(self, *_):
         '''SIGWINCH handler'''
         curses.endwin()
@@ -182,7 +177,7 @@ class Screen(CursesStdIO):
                      self.rows, self.cols)
         self.stdscr.erase()
         if self.help:
-            self.display_help()
+            self.paintHelp()
         else:
             # This should draw all the other parts
             self.paintStatus()
@@ -197,10 +192,12 @@ class Screen(CursesStdIO):
         self.close()
 
     def paintHeader(self):
+        '''Display the cluster summary data at the top of the screen: node counts
+        '''
         if not self.header_data:
             return  # No data!
 
-    @add_summary(functions, 'c', 'Cluster Summary')
+    @add_summary(functions, 'd', 'DC Summary')
     def paintClusterRollup(self):
         'Display cluster summary data'
         pass
@@ -265,7 +262,7 @@ class Screen(CursesStdIO):
         pass
 
     @log_exceptions()
-    def display_help(self):
+    def paintHelp(self):
         '''Draw the help page.  Try to keep the helpstrings up to date and meaningfull.
         '''
         offset = 4
@@ -275,6 +272,7 @@ class Screen(CursesStdIO):
         helpscr.box()
 
         def helpscr_addnstr(y, msg):
+            'DRY wrapper for drawing strings'
             if not RESTY > y + 1:
                 return False
             helpscr.addnstr(y, (offset / 2) + 1, msg, RESTX - offset)
@@ -331,7 +329,7 @@ class Screen(CursesStdIO):
                 self.delay -= 1
         elif key in self.functions:  # This is managed by a decorator
             self.current_function = self.functions[key]
-            self.current_function()
+            self.current_function(self)
         elif key in '1234567890':
             value = (int(key) - 1 + 10) % 10  # Convert to [0..9]
             if self.max_sort_key > value:
@@ -351,7 +349,7 @@ class Screen(CursesStdIO):
                     value = 0
                 self.sort_key = value
         elif key == '?':
-            return self.display_help()
+            return self.paintHelp()
         self.paintStatus()
         self.stdscr.refresh()
 
@@ -399,8 +397,6 @@ def setup_logging(option_group):
 def register_hosts(option_group):
     '''Sets up the global list of hosts.
     '''
-    url = 'http://%(seed_host)s:%(mx4j_port)s/getattribute?objectname=org.apache.cassandra.net:type=FailureDetector&attribute=AllEndpointStates&operation=getattribute&template=identity' % vars(
-        option_group)
     url = 'http://' + option_group.seed_host + ':' + str(option_group.mx4j_port) + '/getattribute?' + \
         'objectname=org.apache.cassandra.net:type=FailureDetector' + \
         '&attribute=AllEndpointStates' + \
@@ -480,6 +476,12 @@ def type_convertor(data_type, data_value):
 
 @log_exceptions()
 def parse_data(xml_blob):
+    '''Take all that wonderful XML and turn it into a dictionary of Python
+    types.  In theory, if things were structured a bit differently,
+    xmltodict could take a helper function to do this "in place".  Sadly, I
+    think this is cleaner.
+
+    '''
     global end_time
     data = xmltodict.parse(xml_blob)['Server']['MBean']
     converted_data = {}
@@ -523,15 +525,15 @@ def parse_data(xml_blob):
 
 
 def update_data(datadict, endpoint):
-    # There are a few odd types in the master data that need to be updated
-    # intelligently rather than just being blindly overwritten.
+    '''There are a few odd types in the master data that need to be updated
+    intelligently rather than just being blindly overwritten.'''
     for objectclass, attribute in [
             ['org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency',
-                '75thPercentile'],
+             '75thPercentile'],
             ['org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency',
-                '75thPercentile'],
+             '75thPercentile'],
             ['org.apache.cassandra.metrics:type=ClientRequest,scope=RangeSlice,name=Latency',
-                '75thPercentile'],
+             '75thPercentile'],
             ['org.apache.cassandra.db:type=DynamicEndpointSnitch', 'Severity']
     ]:
         if objectclass in datadict:
@@ -554,9 +556,10 @@ def cli():
     parser.add_argument("-v", "--verbose", dest="verbose", action='store_true',
                         default=False, help="Verbose output")
     parser.add_argument("-d", "--debug", dest="debug", action='store_true',
-                        default=False, help="Debugging output, also opens a telnet server on port localhost:2222 with admin/aaa")
+                        default=False,
+                        help="Debugging output, also opens a telnet server on port localhost:2222 with admin/aaa")
     parser.add_argument("--syslog", dest="syslog", metavar="FACILITY",
-                        help="Send log messages to the syslog (default USER if neither syslog nor logfile are specified)")
+                        help="Send log messages to the syslog (default USER if logfile is not specified)")
     parser.add_argument("--logfile", dest="logfile", metavar="FILENAME",
                         help="Send log messages to a file")
     # script-specific options here
