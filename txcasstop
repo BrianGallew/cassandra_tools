@@ -77,6 +77,8 @@ class MovingAverages(object):
     def add(self, value):
         '''Add a new value, timestamped appropriately.  Throw away any old
         values, then re-compute the moving averages.'''
+        if value == None:
+            value = 0.0
         now = time.time()
         self.queue.appendleft((value, now))
         # These two lines discard old stuff
@@ -394,6 +396,10 @@ def register_hosts(option_group):
     '''
     url = 'http://%(seed_host)s:%(mx4j_port)s/getattribute?objectname=org.apache.cassandra.net:type=FailureDetector&attribute=AllEndpointStates&operation=getattribute&template=identity' % vars(
         option_group)
+    url = 'http://' + option_group.seed_host + ':' + str(option_group.mx4j_port) + '/getattribute?' + \
+        'objectname=org.apache.cassandra.net:type=FailureDetector' + \
+        '&attribute=AllEndpointStates' + \
+        '&operation=getattribute' + '&template=identity'
     ring_data = xmltodict.parse(urllib2.urlopen(url, None, 30))
     value = ring_data['MBean']['Attribute']['@value']
     for row in re.split('^/', value, flags=re.MULTILINE):
@@ -447,7 +453,7 @@ def type_convertor(data_type, data_value):
         elif data_type == 'int' or data_type == 'long' or data_type == 'java.lang.Long':
             retval = int(data_value)
         elif data_type == 'float' or data_type == 'double':
-            retvale = float(data_value)
+            retval = float(data_value)
         elif data_type == 'java.util.List' or data_type == 'java.util.Set':
             retval = [x.strip() for x in data_value[1:-1].split(',')]
         elif data_type == 'java.util.Map':
