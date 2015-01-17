@@ -31,7 +31,7 @@ import termios
 import pprint
 import types
 from log_exceptions import log_exceptions  # Debugging tool
-
+import traceback
 # Yay, Twisted!
 from twisted.internet import reactor
 from twisted.internet.task import LoopingCall
@@ -42,8 +42,79 @@ from twisted.internet.error import ReactorNotRunning
 endpoints = {}                  # All Cassandra endpoints
 start_time = 0.0
 end_time = 0.0
+
+# interned strings because TYPOS
 ATTRIBUTE = 'Attribute'
 CLASSNAME = '@classname'
+LIVE_NODES = 'Live Nodes'
+DEAD_NODES = 'Dead Nodes'
+READ_ONE = 'Read One Minute Rate'
+READ_FIVE = 'Read Five Minute Rate'
+READ_FIFTEEN = 'Read Fifteen Minute Rate'
+LREAD_ONE = 'Read One Minute Latency'
+LREAD_FIVE = 'Read Five Minute Latency'
+LREAD_FIFTEEN = 'Read Fifteen Minute Latency'
+WRITE_ONE = 'Write One Minute Rate'
+WRITE_FIVE = 'Write Five Minute Rate'
+WRITE_FIFTEEN = 'Write Fifteen Minute Rate'
+LWRITE_ONE = 'Write One Minute Latency'
+LWRITE_FIVE = 'Write Five Minute Latency'
+LWRITE_FIFTEEN = 'Write Fifteen Minute Latency'
+SEVENTY_FIFTH = '75thPercentile'
+ONE_MINUTE_RATE = 'OneMinuteRate'
+FIVE_MINUTE_RATE = 'FiveMinuteRate'
+FIFTEEN_MINUTE_RATE = 'FifteenMinuteRate'
+COMPACTION_MANAGER = 'org.apache.cassandra.db:type=CompactionManager'
+CLIENT_READ_LATENCY = 'org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency'
+CLIENT_WRITE_LATENCY = 'org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency'
+
+# Everything has to be more complicated
+# {fa2f0653-4de6-384c-bf3e-96e26fea39db=[10.12.26.132], f0de9586-91cf-30e7-8bd9-e056decd502d=[10.12.26.134, 10.12.26.133], a0be4aed-d3b4-35f9-8346-96c1db58518f=[10.12.26.135]}
+
+
+@log_exceptions()
+def string_to_map(data, extra):
+    '''Convert a string containing a java.lang.Map to a dictionary
+    '''
+    map_value = {}
+    data = data[1:-1]
+    if not ']' in data:
+        rows = data.split(',')
+    else:
+        rows = []
+        for entity in data.split('], '):
+            rows.append(entity + ']')
+        rows[-1] = rows[-1][:-1]  # Strip the extra ']' from the last element.
+    for line in rows:
+        x, y = line.split('=', 1)
+        map_value[x.strip()] = y.strip()
+    # Do the assignment last in case of an exception
+    return map_value
+
+
+@log_exceptions()
+def extract_compactions(data_block):
+    '''Compactions are a little annoying to extract by virtue of the fact that
+    they are composed of two "values": PendingTasks and Compactions.  This
+    is further complicated by the fact that Compactions is a list of maps,
+    and is often misparsed because Java sucks.
+
+    '''
+    compactions = 0.0
+    subset = data_block.get(COMPACTION_MANAGER, [])
+    if subset:
+        compactions += subset.get('PendingTasks', 0)
+        # This includes repairs and validation and stuff.  Sorry.
+        running_compactions = subset.get('Compactions', None)
+        if running_compactions:
+            total = 0.0
+            done = 0.0
+            for row in subset.get('Compactions'):
+                total += int(row.get('total', 0))
+                done += int(row.get('completed', 0))
+            if total:
+                compactions += (total - done) / total
+    return compactions
 
 
 def add_summary(functions, key, summary):
@@ -154,6 +225,7 @@ class Screen(object):
         curses.start_color()
         curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
         curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
 
         self.updateSize()
         self.paintStatus()
@@ -167,6 +239,18 @@ class Screen(object):
         '''Prefix added to twisted logging functions
         '''
         return 'CursesClient'
+
+    def addstr(self, y, x, msg, attributes=None):
+        'DRY wrapper for drawing strings'
+        if not self.rows > y + 1:
+            return False
+        if not self.cols > x + 1:
+            return False
+        if attributes:
+            self.stdscr.addnstr(y, x, msg, self.cols - x - 1, attributes)
+        else:
+            self.stdscr.addnstr(y, x, msg, self.cols - x - 1)
+        return True
 
     def updateSize(self, *_):
         '''SIGWINCH handler'''
@@ -196,6 +280,55 @@ class Screen(object):
         '''
         if not self.header_data:
             return  # No data!
+        self.addstr(0, 0, 'Nodes:', curses.A_BOLD)
+        y, x = self.stdscr.getyx()
+        self.addstr(
+            y, x + 1, str(self.header_data[LIVE_NODES]) + '/', curses.color_pair(0))
+        if self.header_data[DEAD_NODES]:
+            attributes = curses.color_pair(3) | curses.A_BOLD
+        else:
+            attributes = curses.color_pair(0)
+        y, x = self.stdscr.getyx()
+        self.addstr(
+            y, x, str(self.header_data[DEAD_NODES]), attributes)
+
+        self.addstr(y, 35, 'Rrate:', curses.A_BOLD)
+        y, x = self.stdscr.getyx()
+        self.addstr(y, x + 1, '%d/%d/%d' % (
+            self.header_data[READ_ONE],
+            self.header_data[READ_FIVE],
+            self.header_data[READ_FIFTEEN]
+        ))
+
+        self.addstr(y, 65, 'RLatency:', curses.A_BOLD)
+        y, x = self.stdscr.getyx()
+        self.addstr(y, x + 1, '%0.2f/%0.2f/%0.2f' % (
+            self.header_data[LREAD_ONE],
+            self.header_data[LREAD_FIVE],
+            self.header_data[LREAD_FIFTEEN]
+        ))
+
+        # row 2
+        self.addstr(1, 0, 'Compactions:', curses.A_BOLD)
+        y, x = self.stdscr.getyx()
+        self.addstr(
+            y, x + 1, '%0.2f/%0.2f/%0.2f' % self.cluster_compaction_averages.get_all(), curses.color_pair(0))
+
+        self.addstr(y, 35, 'Wrate:', curses.A_BOLD)
+        y, x = self.stdscr.getyx()
+        self.addstr(y, x + 1, '%d/%d/%d' % (
+            self.header_data[WRITE_ONE],
+            self.header_data[WRITE_FIVE],
+            self.header_data[WRITE_FIFTEEN]
+        ))
+
+        self.addstr(y, 65, 'WLatency:', curses.A_BOLD)
+        y, x = self.stdscr.getyx()
+        self.addstr(y, x + 1, '%0.2f/%0.2f/%0.2f' % (
+            self.header_data[LWRITE_ONE],
+            self.header_data[LWRITE_FIVE],
+            self.header_data[LWRITE_FIFTEEN]
+        ))
 
     @add_summary(functions, 'd', 'DC Summary')
     def paintClusterRollup(self):
@@ -250,6 +383,7 @@ class Screen(object):
             row, self.cols - len_help_indicator - 1, self.help_indicator, curses.color_pair(1))
         self.stdscr.refresh()
 
+    @log_exceptions()
     def reload_data(self):
         '''Re-load all cumulative data.'''
         if not endpoints:
@@ -258,7 +392,59 @@ class Screen(object):
             key = endpoints.keys()[0]
             self.ring_name = endpoints[key].get(
                 'org.apache.cassandra.db:type=StorageService', {}).get('ClusterName', '')
+            sys.stdout.write(']0;Cassandra Top - %s' % self.ring_name)
+        self.header_data[LIVE_NODES] = len(endpoints)
+        self.header_data[DEAD_NODES] = 0
+        self.header_data[READ_ONE] = 0.0
+        self.header_data[READ_FIVE] = 0.0
+        self.header_data[READ_FIFTEEN] = 0.0
+        self.header_data[LREAD_ONE] = 0.0
+        self.header_data[LREAD_FIVE] = 0.0
+        self.header_data[LREAD_FIFTEEN] = 0.0
+        self.header_data[WRITE_ONE] = 0.0
+        self.header_data[WRITE_FIVE] = 0.0
+        self.header_data[WRITE_FIFTEEN] = 0.0
+        self.header_data[LWRITE_ONE] = 0.0
+        self.header_data[LWRITE_FIVE] = 0.0
+        self.header_data[LWRITE_FIFTEEN] = 0.0
+
+        compactions = 0
+        for node in endpoints:
+            try:
+                data_block = endpoints[node]
+                compactions += extract_compactions(data_block)
+                # Rates
+                one, five, fifteen = data_block[
+                    CLIENT_READ_LATENCY][SEVENTY_FIFTH].get_all()
+                self.header_data[LREAD_ONE] += one / 100000
+                self.header_data[LREAD_FIVE] += five / 100000
+                self.header_data[LREAD_FIFTEEN] += fifteen / 100000
+                one, five, fifteen = data_block[
+                    CLIENT_WRITE_LATENCY][SEVENTY_FIFTH].get_all()
+                self.header_data[LWRITE_ONE] += one / 100000
+                self.header_data[LWRITE_FIVE] += five / 100000
+                self.header_data[LWRITE_FIFTEEN] += fifteen / 100000
+                # Latencies
+                self.header_data[READ_ONE] += data_block[
+                    CLIENT_WRITE_LATENCY][ONE_MINUTE_RATE]
+                self.header_data[READ_FIVE] += data_block[
+                    CLIENT_WRITE_LATENCY][FIVE_MINUTE_RATE]
+                self.header_data[READ_FIFTEEN] += data_block[
+                    CLIENT_WRITE_LATENCY][FIFTEEN_MINUTE_RATE]
+                self.header_data[WRITE_ONE] += data_block[
+                    CLIENT_WRITE_LATENCY][ONE_MINUTE_RATE]
+                self.header_data[WRITE_FIVE] += data_block[
+                    CLIENT_WRITE_LATENCY][FIVE_MINUTE_RATE]
+                self.header_data[WRITE_FIFTEEN] += data_block[
+                    CLIENT_WRITE_LATENCY][FIFTEEN_MINUTE_RATE]
+            except Exception as e:
+                logging.critical(traceback.format_exc())
+                self.header_data[DEAD_NODES] += 1
+                self.header_data[LIVE_NODES] -= 1
+        self.cluster_compaction_averages.add(compactions)
         self.paintStatus()
+        self.paintHeader()
+        self.current_function()
         pass
 
     @log_exceptions()
@@ -456,14 +642,17 @@ def type_convertor(data_type, data_value):
         elif data_type == 'float' or data_type == 'double':
             retval = float(data_value)
         elif data_type == 'java.util.List' or data_type == 'java.util.Set':
-            retval = [x.strip() for x in data_value[1:-1].split(',')]
+            data_value = data_value[1:-1]  # Strip of the leading/trailing []
+            if data_value[0] == '{':      # This is a list of maps.  Ugh.
+                retval = []
+                for row in data_value.split('}, '):
+                    if not row[-1] == '}':
+                        row += '}'
+                    retval.append(string_to_map(row, data_value))
+            else:
+                retval = [x.strip() for x in data_value[1:-1].split(',')]
         elif data_type == 'java.util.Map':
-            map_value = {}
-            for line in data_value[1:-1].split(','):
-                x, y = line.split('=')
-                map_value[x.strip()] = y.strip()
-            # Do the assignment last in case of an exception
-            retval = map_value
+            retval = string_to_map(data_value, '')
         else:
             # I don't care about any of the remaining types at this
             # point.  I hope.
@@ -528,12 +717,10 @@ def update_data(datadict, endpoint):
     '''There are a few odd types in the master data that need to be updated
     intelligently rather than just being blindly overwritten.'''
     for objectclass, attribute in [
-            ['org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency',
-             '75thPercentile'],
-            ['org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency',
-             '75thPercentile'],
-            ['org.apache.cassandra.metrics:type=ClientRequest,scope=RangeSlice,name=Latency',
-             '75thPercentile'],
+            [CLIENT_READ_LATENCY, SEVENTY_FIFTH],
+            [CLIENT_WRITE_LATENCY, SEVENTY_FIFTH],
+            #['org.apache.cassandra.metrics:type=ClientRequest,scope=RangeSlice,name=Latency',
+            # SEVENTY_FIFTH],
             ['org.apache.cassandra.db:type=DynamicEndpointSnitch', 'Severity']
     ]:
         if objectclass in datadict:
