@@ -268,12 +268,21 @@ class Screen(object):
         self.stdscr.refresh()
         return
 
-    def connectionLost(self, _):
-        '''Standard twisted-required function to handle lost "connections" It
-        should only ever be used in the event that stdin gets closed.
-
-        '''
-        self.close()
+    def connectionLost(self, *_):
+        """ clean up """
+        if self.closed:
+            return
+        curses.nocbreak()
+        self.stdscr.keypad(0)
+        curses.echo()
+        curses.endwin()
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self.old_tty)
+        self.closed = True
+        try:
+            reactor.stop()
+        except ReactorNotRunning:
+            pass
+        return
 
     def paintHeader(self):
         '''Display the cluster summary data at the top of the screen: node counts
@@ -506,7 +515,7 @@ class Screen(object):
             return
         if key in 'qQ':
             logging.debug('quitting by user request')
-            self.close()
+            self.connectionLost()
             return
         elif key == '+':
             self.delay += 1
@@ -538,21 +547,6 @@ class Screen(object):
             return self.paintHelp()
         self.paintStatus()
         self.stdscr.refresh()
-
-    def close(self):
-        """ clean up """
-        if self.closed:
-            return
-        curses.nocbreak()
-        self.stdscr.keypad(0)
-        curses.echo()
-        curses.endwin()
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self.old_tty)
-        self.closed = True
-        try:
-            reactor.stop()
-        except ReactorNotRunning:
-            pass
 
 
 def setup_logging(option_group):
@@ -610,11 +604,17 @@ def schedule_cluster(option_group, screen):
     # Now, set up Deferreds for all of the URLs that need to be gotten.
     deferreds = []
     for endpoint in endpoints:
-        url = 'http://%s:%s/mbean?template=identity&operations=false&constructors=false&notifications=false&' % (
+        url = 'http://%s:%s/mbean?template=identity&operations=false&constructors=false&notifications=false&objectname=' % (
             endpoint, option_group.mx4j_port)
         for query in [
-                'objectname=org.apache.cassandra.metrics:type=ClientRequest,scope=*,name=*',
-                'objectname=*:type=*'
+                'org.apache.cassandra.db:type=CompactionManager',
+                'org.apache.cassandra.db:type=StorageService',
+                'org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency',
+                'org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency',
+                'org.apache.cassandra.metrics:type=ClientRequest,scope=RangeSlice,name=Latency',
+
+                #'objectname=org.apache.cassandra.metrics:type=ClientRequest,scope=*,name=*',
+                #'objectname=*:type=*'
         ]:
             logging.debug('dispatching GET for %s', url + query)
             deferreds.append(getPage(url + query))
@@ -627,7 +627,7 @@ def type_convertor(data_type, data_value):
     '''Convert Java types into Python types.  This is incomplete, but meh.
     '''
     if 'Write-only' in data_value:
-        return None
+        return 'Write-only'
     retval = None
     try:
         if data_type == 'java.lang.String' or data_type == '[Ljava.lang.String':
@@ -699,20 +699,30 @@ def parse_data(xml_blob):
         elif a_type == collections.OrderedDict:
             data_item = bean[ATTRIBUTE]
             try:
-                converted_data[label][data_item['@name']] = type_convertor(
+                destination[label][data_item['@name']] = type_convertor(
                     data_item['@type'], data_item['@value'])
                 logging.debug(
-                    '%s:%s', label, converted_data[label][data_item['@name']])
+                    'FOO - %s:%s:%s:%s', label, destination[label][data_item['@name']], data_item['@type'], data_item['@value'])
             except:
                 logging.warn(
                     'Error converting %s:%s', bean['@objectname'], data_item)
-        else:
-            logging.critical(
-                'No handler for %s: type %s', str(bean), a_type)
-    end_time = time.time()
-    return converted_data
+    elif a_type == collections.OrderedDict:
+        data_item = bean[ATTRIBUTE]
+        try:
+            destination[label][data_item['@name']] = type_convertor(
+                data_item['@type'], data_item['@value'])
+            logging.debug(
+                '%s:%s', label, destination[label][data_item['@name']])
+        except:
+            logging.warn(
+                'Error converting %s:%s', bean['@objectname'], data_item)
+    else:
+        logging.critical(
+            'No handler for %s: type %s', str(bean), a_type)
+    return
 
 
+@log_exceptions()
 def update_data(datadict, endpoint):
     '''There are a few odd types in the master data that need to be updated
     intelligently rather than just being blindly overwritten.'''
@@ -735,6 +745,7 @@ def update_data(datadict, endpoint):
     return
 
 
+@log_exceptions()
 def cli():
     '''Put argument selection/parsing in here for neatness
     '''
@@ -760,6 +771,7 @@ def cli():
     return options
 
 
+@log_exceptions()
 def main():
     """Primary entry point."""
     options = cli()
@@ -786,7 +798,7 @@ def main():
         reactor.run()  # have fun!
     except Exception as e:
         raise e
-    screen.close()              # Just in case!
+    screen.connectionLost()              # Just in case!
 
     return
 
