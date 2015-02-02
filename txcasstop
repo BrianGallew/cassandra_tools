@@ -233,7 +233,6 @@ class Screen(object):
         curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
 
         self.updateSize()
-        self.paintStatus()
         self.stdscr.refresh()
 
     def fileno(self):
@@ -297,6 +296,10 @@ class Screen(object):
         '''
         if not self.header_data:
             return  # No data!
+        self.stdscr.move(0, 0)
+        self.stdscr.clrtoeol()
+        self.stdscr.move(1, 0)
+        self.stdscr.clrtoeol()
         self.addstr(0, 0, 'Nodes:', curses.A_BOLD)
         y, x = self.stdscr.getyx()
         self.addstr(
@@ -383,6 +386,11 @@ class Screen(object):
         '''Paint the status line at the bottom of the screen.
         Refresh schedule/time, current display mode, and help prompt.
         '''
+        if not self.header_data:
+            self.stdscr.addstr(
+                0, 0, 'Loading data', curses.color_pair(1))
+            return
+
         row = self.rows - 1
         status_message = 'Update frequency: %ds (%0.2f) %d' % (
             update_delay, end_time - start_time, deferred_count)
@@ -403,14 +411,16 @@ class Screen(object):
     @log_exceptions()
     def reload_data(self):
         '''Re-load all cumulative data.'''
+        logging.debug('reload_data: %s', str(endpoints))
         if not endpoints:
             return  # First run
-        logging.debug(str(endpoints))
         if not self.ring_name:
             key = endpoints.keys()[0]
             self.ring_name = endpoints[key].get(
                 'org.apache.cassandra.db:type=StorageService', {}).get('ClusterName', '')
             sys.stdout.write(']0;Cassandra Top - %s' % self.ring_name)
+
+        # Start with a blank slate for header data every time.
         self.header_data[LIVE_NODES] = len(endpoints)
         self.header_data[DEAD_NODES] = 0
         self.header_data[READ_ONE] = 0.0
@@ -425,8 +435,10 @@ class Screen(object):
         self.header_data[LWRITE_ONE] = 0.0
         self.header_data[LWRITE_FIVE] = 0.0
         self.header_data[LWRITE_FIFTEEN] = 0.0
-
         compactions = 0
+
+        # Now loop through the data for each end point and update the various
+        # accumulators
         for node in endpoints:
             try:
                 data_block = endpoints[node]
@@ -439,24 +451,28 @@ class Screen(object):
                 self.header_data[LREAD_ONE] += one / 100000
                 self.header_data[LREAD_FIVE] += five / 100000
                 self.header_data[LREAD_FIFTEEN] += fifteen / 100000
+
                 one, five, fifteen = data_block[
                     CLIENT_WRITE_LATENCY][SEVENTY_FIFTH].get_all()
                 self.header_data[LWRITE_ONE] += one / 100000
                 self.header_data[LWRITE_FIVE] += five / 100000
                 self.header_data[LWRITE_FIFTEEN] += fifteen / 100000
+
                 # Latencies
                 self.header_data[READ_ONE] += data_block[
-                    CLIENT_WRITE_LATENCY][ONE_MINUTE_RATE]
+                    CLIENT_READ_LATENCY][ONE_MINUTE_RATE]
                 self.header_data[READ_FIVE] += data_block[
-                    CLIENT_WRITE_LATENCY][FIVE_MINUTE_RATE]
+                    CLIENT_READ_LATENCY][FIVE_MINUTE_RATE]
                 self.header_data[READ_FIFTEEN] += data_block[
-                    CLIENT_WRITE_LATENCY][FIFTEEN_MINUTE_RATE]
+                    CLIENT_READ_LATENCY][FIFTEEN_MINUTE_RATE]
+
                 self.header_data[WRITE_ONE] += data_block[
                     CLIENT_WRITE_LATENCY][ONE_MINUTE_RATE]
                 self.header_data[WRITE_FIVE] += data_block[
                     CLIENT_WRITE_LATENCY][FIVE_MINUTE_RATE]
                 self.header_data[WRITE_FIFTEEN] += data_block[
                     CLIENT_WRITE_LATENCY][FIFTEEN_MINUTE_RATE]
+
             except Exception as e:
                 logging.critical(traceback.format_exc())
                 self.header_data[DEAD_NODES] += 1
@@ -615,17 +631,17 @@ def schedule_cluster(option_group, screen):
     '''Schedule calls of all cluster data'''
     # First, update the cluster display to the current state.
     global start_time, deferred_count
+    if deferred_count:
+        return
     now = time.time()
     current_delay = now - start_time
     if current_delay < update_delay:
         return
-    if current_delay < 10000:
-        screen.reload_data()
-    if deferred_count:
-        return
-    start_time = now
-    logging.info('scheduling cluster')
+    screen.reload_data()
+    logging.info('Took %f seconds to reload the screen', time.time() - now)
     # Now, set up Deferreds for all of the URLs that need to be gotten.
+    start_time = now
+    all_deferreds = []
     for endpoint in endpoints:
         url = 'http://%s:%s/mbean?template=identity&operations=false&constructors=false&notifications=false&objectname=' % (
             endpoint, option_group.mx4j_port)
@@ -644,7 +660,8 @@ def schedule_cluster(option_group, screen):
             deferred.addCallback(parse_data)
             deferred.addCallbacks(update_data,
                                   no_update_data, callbackArgs=(endpoint,))
-            deferred_count += 1
+            all_deferreds.append(deferred)
+    deferred_count = len(all_deferreds)
     return
 
 
@@ -822,7 +839,7 @@ def main():
     try:
         # add screen object as a reader to the reactor
         lc = LoopingCall(schedule_cluster, options, screen)
-        lc.start(0.5)
+        lc.start(0.25, True)
         reactor.addReader(screen)
         if options.debug:
             import twisted.manhole.telnet
