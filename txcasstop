@@ -430,7 +430,7 @@ class Screen(object):
         # Sort the data on the appropriate column.  Not all columns really
         # make sense, but this is easy this way.
         key_list = sorted(database.keys(), lambda x, y: cmp(
-            database[x][self.sort_key], database[y][self.sort_key]))
+            database[y][self.sort_key], database[x][self.sort_key]))
         y = 3
         for idx, label in enumerate([' DC', 'Nodes ', 'Racks', '   Load', ' Comps', 'Rlat', 'Rrate', 'Wlat', 'Wrate']):
             if idx == self.sort_key:
