@@ -381,7 +381,8 @@ class Screen(object):
     @add_summary(functions, 'd', 'DC Summary', 8)
     def paintClusterRollup(self):
         'Display cluster summary data'
-        self.sort_key = self.sort_key % self.current_function.max_sort_key
+        self.sort_key = self.sort_key % (
+            self.current_function.max_sort_key + 1)
         database = {}
         columns = [0, 6, 12, 18, 28, 36, 42, 50, 56]
         formats = ['{0:s}', '{0:^5s}', '{0:^5d}', '{0:>9s}',
@@ -647,15 +648,11 @@ class Screen(object):
             self.current_function()
         elif key in '<>':
             if key == '>':
-                value = self.sort_key + 1
-                if self.current_function.max_sort_key > value:
-                    self.sort_key = value
-                else:
-                    self.sort_key = self.current_function.max_sort_key
+                self.sort_key += 1
             else:
-                self.sort_key -= 1
-                if self.sort_key < 0:
-                    self.sort_key = self.current_function.max_sort_key
+                self.sort_key += (self.current_function.max_sort_key)
+            self.sort_key = self.sort_key % (
+                self.current_function.max_sort_key + 1)
             self.current_function()
         elif key == '?':
             return self.paintHelp()
