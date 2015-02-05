@@ -386,7 +386,7 @@ class Screen(object):
         database = {}
         columns = [0, 6, 12, 18, 28, 36, 42, 50, 56]
         formats = ['{0:s}', '{0:^5s}', '{0:^5d}', '{0:>9s}',
-                   '{0:>6.2f}', '{0:>4d}', '{0:>5d}', '{0:>4d}', '{0:>5d}']
+                   '{0:>6.2f}', '{0:>4.2f}', '{0:>5.0f}', '{0:>4.2f}', '{0:>5.0f}']
         for endpoint in endpoints:
             host_data = endpoints[endpoint]
             if not host_data:
@@ -395,24 +395,25 @@ class Screen(object):
             if not host_data[DATACENTER] in database:
                 # Do it this way because setdefault doesn't do what I want.
                 database[host_data[DATACENTER]] = [
-                    DATACENTER, 0, 0, {}, 0.0, 0.0, 0, 0, 0, 0]
+                    host_data[DATACENTER], 0, 0, {}, 0.0, 0.0, 0, 0, 0, 0]
             try:
                 current_group = database[host_data[DATACENTER]]
                 current_group[3][host_data[RACK]] = 0
                 current_group[4] += host_data[STORAGE_SERVICE]['Load']
                 current_group[5] += host_data[COMPACTIONS]
                 current_group[
-                    6] += host_data[CLIENT_READ_LATENCY][SEVENTY_FIFTH].get_all()
+                    6] += host_data[CLIENT_READ_LATENCY][SEVENTY_FIFTH].get_all()[0]
                 current_group[
                     7] += host_data[CLIENT_READ_LATENCY][ONE_MINUTE_RATE]
                 current_group[
-                    8] += host_data[CLIENT_WRITE_LATENCY][SEVENTY_FIFTH].get_all()
+                    8] += host_data[CLIENT_WRITE_LATENCY][SEVENTY_FIFTH].get_all()[0]
                 current_group[
                     9] += host_data[CLIENT_WRITE_LATENCY][ONE_MINUTE_RATE]
                 # Do this last, as an exception anywhere above should turn this
                 # into a dead node
                 current_group[1] += 1
-            except:
+            except Exception as e:
+                logging.warn('%s: %s', e, str(current_group))
                 current_group[2] += 1
         # reformat the data a little
         for key in database.keys():
@@ -423,6 +424,9 @@ class Screen(object):
             database[key][2] = len(database[key][2])
             # Make this number human-readable
             database[key][3] = humanize(database[key][3])
+            # Fix latency numbers
+            database[key][5] = database[key][5] / 100000
+            database[key][7] = database[key][7] / 100000
         # Sort the data on the appropriate column.  Not all columns really
         # make sense, but this is easy this way.
         key_list = sorted(database.keys(), lambda x, y: cmp(
