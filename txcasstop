@@ -42,7 +42,7 @@ from twisted.internet.error import ReactorNotRunning
 endpoints = {}                  # All Cassandra endpoints
 start_time = 0
 end_time = time.time()
-update_delay = 5
+update_delay = 3
 deferred_count = 0
 
 # interned strings because TYPOS
@@ -68,9 +68,17 @@ SEVENTY_FIFTH = '75thPercentile'
 ONE_MINUTE_RATE = 'OneMinuteRate'
 FIVE_MINUTE_RATE = 'FiveMinuteRate'
 FIFTEEN_MINUTE_RATE = 'FifteenMinuteRate'
-COMPACTION_MANAGER = 'org.apache.cassandra.db:type=CompactionManager'
+HINTS = 'Hints'
+DATACENTER = 'DC'
+RACK = 'RACK'
+COMPACTIONS = 'Compactions'
+
+CLIENT_RANGE_LATENCY = 'org.apache.cassandra.metrics:type=ClientRequest,scope=RangeSlice,name=Latency'
 CLIENT_READ_LATENCY = 'org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency'
 CLIENT_WRITE_LATENCY = 'org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency'
+COMPACTION_MANAGER = 'org.apache.cassandra.db:type=CompactionManager'
+HINT_STATISTICS = 'org.apache.cassandra.db:type=ColumnFamilies,keyspace=system,columnfamily=hints'
+STORAGE_SERVICE = 'org.apache.cassandra.db:type=StorageService'
 
 # Everything has to be more complicated
 # {fa2f0653-4de6-384c-bf3e-96e26fea39db=[10.12.26.132], f0de9586-91cf-30e7-8bd9-e056decd502d=[10.12.26.134, 10.12.26.133], a0be4aed-d3b4-35f9-8346-96c1db58518f=[10.12.26.135]}
@@ -118,10 +126,11 @@ def extract_compactions(data_block):
                 done += int(row.get('completed', 0))
             if total:
                 compactions += (total - done) / total
+    data_block[COMPACTIONS] = compactions
     return compactions
 
 
-def add_summary(functions, key, summary):
+def add_summary(functions, key, summary, max_sort_key):
     '''Decorator to be used on the various methods in the Screen class which
     are to be exposed via help.
     :param functions: Dict to be updated
@@ -137,8 +146,24 @@ def add_summary(functions, key, summary):
         '''Update the  dictionary.'''
         functions[key] = func
         func.summary = summary
+        func.max_sort_key = max_sort_key
         return func
     return real_decorator
+
+
+def humanize(number, format_string='{VALUE:>6.2f} {LABEL}'):
+    '''(Maybe) Convert B (bytes) to the appropriate SI unit
+    :param number: number of bytes
+    :param format_string: output format
+    :returns: formatted string
+    '''
+    label = 'B'
+    for l in ['KB', 'MB', 'GB', 'TB', 'PB']:
+        if number < 1024:
+            break
+        number = number / 1024.0
+        label = l
+    return format_string.format(VALUE=number, LABEL=label)
 
 
 class MovingAverages(object):
@@ -208,7 +233,6 @@ class Screen(object):
     ring_name = ''
     help = False
     help_indicator = " Press '?' for help"
-    max_sort_key = 0
     sort_key = 0
     functions = {}
     cluster_compaction_averages = MovingAverages()
@@ -228,9 +252,13 @@ class Screen(object):
 
         # create color pair's 1 and 2
         curses.start_color()
+        self.normal = curses.color_pair(0)
         curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
+        self.inverse = curses.color_pair(1)
         curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        self.green = curses.color_pair(2)
         curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
+        self.red = curses.color_pair(3)
 
         self.updateSize()
         self.stdscr.refresh()
@@ -303,11 +331,11 @@ class Screen(object):
         self.addstr(0, 0, 'Nodes:', curses.A_BOLD)
         y, x = self.stdscr.getyx()
         self.addstr(
-            y, x + 1, str(self.header_data[LIVE_NODES]) + '/', curses.color_pair(0))
+            y, x + 1, str(self.header_data[LIVE_NODES]) + '/', self.normal)
         if self.header_data[DEAD_NODES]:
-            attributes = curses.color_pair(3) | curses.A_BOLD
+            attributes = self.red | curses.A_BOLD
         else:
-            attributes = curses.color_pair(0)
+            attributes = self.normal
         y, x = self.stdscr.getyx()
         self.addstr(
             y, x, str(self.header_data[DEAD_NODES]), attributes)
@@ -332,7 +360,7 @@ class Screen(object):
         self.addstr(1, 0, 'Compactions:', curses.A_BOLD)
         y, x = self.stdscr.getyx()
         self.addstr(
-            y, x + 1, '%0.2f/%0.2f/%0.2f' % self.cluster_compaction_averages.get_all(), curses.color_pair(0))
+            y, x + 1, '%0.2f/%0.2f/%0.2f' % self.cluster_compaction_averages.get_all(), self.normal)
 
         self.addstr(y, 35, 'Wrate:', curses.A_BOLD)
         y, x = self.stdscr.getyx()
@@ -350,33 +378,90 @@ class Screen(object):
             self.header_data[LWRITE_FIFTEEN]
         ))
 
-    @add_summary(functions, 'd', 'DC Summary')
+    @add_summary(functions, 'd', 'DC Summary', 8)
     def paintClusterRollup(self):
         'Display cluster summary data'
+        self.sort_key = self.sort_key % self.current_function.max_sort_key
+        database = {}
+        columns = [0, 6, 12, 18, 28, 36, 42, 50, 56]
+        formats = ['{0:s}', '{0:^5s}', '{0:^5d}', '{0:>9s}',
+                   '{0:>6.2f}', '{0:>4d}', '{0:>5d}', '{0:>4d}', '{0:>5d}']
+        for endpoint in endpoints:
+            host_data = endpoints[endpoint]
+            if not host_data:
+                return
+            logging.debug('host_data: %s', str(host_data.keys()))
+            if not host_data[DATACENTER] in database:
+                # Do it this way because setdefault doesn't do what I want.
+                database[host_data[DATACENTER]] = [
+                    DATACENTER, 0, 0, {}, 0.0, 0.0, 0, 0, 0, 0]
+            try:
+                current_group = database[host_data[DATACENTER]]
+                current_group[3][host_data[RACK]] = 0
+                current_group[4] += host_data[STORAGE_SERVICE]['Load']
+                current_group[5] += host_data[COMPACTIONS]
+                current_group[
+                    6] += host_data[CLIENT_READ_LATENCY][SEVENTY_FIFTH].get_all()
+                current_group[
+                    7] += host_data[CLIENT_READ_LATENCY][ONE_MINUTE_RATE]
+                current_group[
+                    8] += host_data[CLIENT_WRITE_LATENCY][SEVENTY_FIFTH].get_all()
+                current_group[
+                    9] += host_data[CLIENT_WRITE_LATENCY][ONE_MINUTE_RATE]
+                # Do this last, as an exception anywhere above should turn this
+                # into a dead node
+                current_group[1] += 1
+            except:
+                current_group[2] += 1
+        # reformat the data a little
+        for key in database.keys():
+            # combine fields 1 and 2
+            database[key][1] = "%d/%d" % (database[key][1], database[key][2])
+            del database[key][2]
+            # change this to a count of unique racks
+            database[key][2] = len(database[key][2])
+            # Make this number human-readable
+            database[key][3] = humanize(database[key][3])
+        # Sort the data on the appropriate column.  Not all columns really
+        # make sense, but this is easy this way.
+        key_list = sorted(database.keys(), lambda x, y: cmp(
+            database[x][self.sort_key], database[y][self.sort_key]))
+        y = 3
+        for idx, label in enumerate([' DC', 'Nodes ', 'Racks', '   Load', ' Comps', 'Rlat', 'Rrate', 'Wlat', 'Wrate']):
+            if idx == self.sort_key:
+                self.addstr(
+                    y, columns[idx], label, curses.A_BOLD | self.green)
+            else:
+                self.addstr(y, columns[idx], label, curses.A_BOLD)
+        for key in key_list:
+            y += 1
+            self.stdscr.move(y, 0)
+            for idx, item in enumerate(database[key]):
+                self.addstr(y, columns[idx], formats[idx].format(item))
         pass
-    current_function = paintClusterRollup
+    current_function = paintClusterRollup  # This is where the magic happens!
 
-    @add_summary(functions, 'h', 'Host Data')
+    @add_summary(functions, 'h', 'Host Data', 9)
     def paintHostData(self):
         'Display host data'
         pass
 
-    @add_summary(functions, 's', 'Severity')
+    @add_summary(functions, 's', 'Severity', 5)
     def paintCompactionData(self):
         'Display severity (compaction) data'
         pass
 
-    @add_summary(functions, 'l', 'Load')
+    @add_summary(functions, 'l', 'Load', 5)
     def paintLoadDistribution(self):
         'Display load data'
         pass
 
-    @add_summary(functions, 'r', 'Reads')
+    @add_summary(functions, 'r', 'Reads', 5)
     def paintReadStatistics(self):
         'Display read data'
         pass
 
-    @add_summary(functions, 'w', 'Writes')
+    @add_summary(functions, 'w', 'Writes', 5)
     def paintWriteStatistics(self):
         'Display write data'
         pass
@@ -388,7 +473,7 @@ class Screen(object):
         '''
         if not self.header_data:
             self.stdscr.addstr(
-                0, 0, 'Loading data', curses.color_pair(1))
+                0, 0, 'Loading data', self.inverse)
             return
 
         row = self.rows - 1
@@ -397,15 +482,15 @@ class Screen(object):
         status_message = status_message[:self.cols]
         len_status_message = len(status_message)
         self.stdscr.addstr(
-            row, 0, status_message + ' ' * (self.cols - len_status_message - 1), curses.color_pair(1))
+            row, 0, status_message + ' ' * (self.cols - len_status_message - 1), self.inverse)
         len_screen_name = len(self.current_function.summary)
         len_help_indicator = len(self.help_indicator)
         total_len = len_screen_name + len_help_indicator + 1
         if total_len < self.cols:
             self.stdscr.addstr(row, self.cols - len_screen_name -
-                               len_help_indicator - 1, self.current_function.summary, curses.color_pair(2))
+                               len_help_indicator - 1, self.current_function.summary, self.green)
         self.stdscr.addstr(
-            row, self.cols - len_help_indicator - 1, self.help_indicator, curses.color_pair(1))
+            row, self.cols - len_help_indicator - 1, self.help_indicator, self.inverse)
         self.stdscr.refresh()
 
     @log_exceptions()
@@ -417,7 +502,7 @@ class Screen(object):
         if not self.ring_name:
             key = endpoints.keys()[0]
             self.ring_name = endpoints[key].get(
-                'org.apache.cassandra.db:type=StorageService', {}).get('ClusterName', '')
+                STORAGE_SERVICE, {}).get('ClusterName', '')
             sys.stdout.write(']0;Cassandra Top - %s' % self.ring_name)
 
         # Start with a blank slate for header data every time.
@@ -445,7 +530,7 @@ class Screen(object):
                 if not CLIENT_READ_LATENCY in data_block:
                     continue
                 compactions += extract_compactions(data_block)
-                # Rates
+                # Latencies
                 one, five, fifteen = data_block[
                     CLIENT_READ_LATENCY][SEVENTY_FIFTH].get_all()
                 self.header_data[LREAD_ONE] += one / 100000
@@ -458,7 +543,7 @@ class Screen(object):
                 self.header_data[LWRITE_FIVE] += five / 100000
                 self.header_data[LWRITE_FIFTEEN] += fifteen / 100000
 
-                # Latencies
+                # Rates
                 self.header_data[READ_ONE] += data_block[
                     CLIENT_READ_LATENCY][ONE_MINUTE_RATE]
                 self.header_data[READ_FIVE] += data_block[
@@ -555,22 +640,23 @@ class Screen(object):
             self.current_function(self)
         elif key in '1234567890':
             value = (int(key) - 1 + 10) % 10  # Convert to [0..9]
-            if self.max_sort_key > value:
+            if self.current_function.max_sort_key > value - 1:
                 self.sort_key = value
             else:
-                self.sort_key = self.max_sort_key
+                self.sort_key = self.current_function.max_sort_key
+            self.current_function()
         elif key in '<>':
             if key == '>':
                 value = self.sort_key + 1
-                if self.max_sort_key > value:
+                if self.current_function.max_sort_key > value:
                     self.sort_key = value
                 else:
-                    self.sort_key = self.max_sort_key
+                    self.sort_key = self.current_function.max_sort_key
             else:
-                value = self.sort_key - 1
-                if value < 0:
-                    value = 0
-                self.sort_key = value
+                self.sort_key -= 1
+                if self.sort_key < 0:
+                    self.sort_key = self.current_function.max_sort_key
+            self.current_function()
         elif key == '?':
             return self.paintHelp()
         self.paintStatus()
@@ -618,11 +704,23 @@ def register_hosts(option_group):
         if 'STATUS:remov' in row:
             continue
 
-        row_pieces = [x.split(':')[1].strip()
-                      for x in row.split() if 'RPC_ADDRESS' in x]
-        complete_address_set = socket.gethostbyaddr(row_pieces[0])
-        endpoint = complete_address_set[0].replace('.cint', '')
-        endpoints[endpoint] = {}
+        host_data = {}
+        for x in row.split():
+            row_pieces = x.split(':', 1)
+            logging.debug(
+                'register_hosts: key - %s', str(row_pieces))
+            if row_pieces[0] == 'RPC_ADDRESS':
+                complete_address_set = socket.gethostbyaddr(
+                    row_pieces[1].strip())
+                endpoint = complete_address_set[0]
+                endpoints[endpoint] = host_data
+            if row_pieces[0] == DATACENTER:
+                host_data[DATACENTER] = row_pieces[1].strip()
+            if row_pieces[0] == RACK:
+                host_data[RACK] = row_pieces[1].strip()
+        logging.debug(
+            'register_hosts: %s', str(host_data))
+
     logging.info(str(endpoints))
 
 
@@ -646,22 +744,20 @@ def schedule_cluster(option_group, screen):
         url = 'http://%s:%s/mbean?template=identity&operations=false&constructors=false&notifications=false&objectname=' % (
             endpoint, option_group.mx4j_port)
         for query in [
-                'org.apache.cassandra.db:type=CompactionManager',
-                'org.apache.cassandra.db:type=StorageService',
-                'org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency',
-                'org.apache.cassandra.metrics:type=ClientRequest,scope=Write,name=Latency',
-                'org.apache.cassandra.metrics:type=ClientRequest,scope=RangeSlice,name=Latency',
-
-                #'objectname=org.apache.cassandra.metrics:type=ClientRequest,scope=*,name=*',
-                #'objectname=*:type=*'
+                COMPACTION_MANAGER,
+                STORAGE_SERVICE,
+                CLIENT_READ_LATENCY,
+                CLIENT_WRITE_LATENCY,
+                HINT_STATISTICS,
+                CLIENT_RANGE_LATENCY,
         ]:
             logging.debug('dispatching GET for %s', url + query)
-            deferred = getPage(url + query)
+            deferred = getPage(url + query, timeout=4)
             deferred.addCallback(parse_data)
             deferred.addCallbacks(update_data,
                                   no_update_data, callbackArgs=(endpoint,))
             all_deferreds.append(deferred)
-    deferred_count = len(all_deferreds)
+            deferred_count += 1
     return
 
 
@@ -685,8 +781,12 @@ def type_convertor(data_type, data_value):
             else:
                 retval = False
         elif data_type in ['int', 'long', 'java.lang.Long']:
+            if 'nan' in data_value.lower():
+                return 0
             retval = int(data_value)
         elif data_type in ['float', 'double']:
+            if 'nan' in data_value.lower():
+                return 0.0
             retval = float(data_value)
         elif data_type in ['java.util.List', 'java.util.Set']:
             if data_value and len(data_value) > 2:
@@ -784,8 +884,6 @@ def update_data(datadict, endpoint, *args):
     for objectclass, attribute in [
             [CLIENT_READ_LATENCY, SEVENTY_FIFTH],
             [CLIENT_WRITE_LATENCY, SEVENTY_FIFTH],
-            #['org.apache.cassandra.metrics:type=ClientRequest,scope=RangeSlice,name=Latency',
-            # SEVENTY_FIFTH],
             ['org.apache.cassandra.db:type=DynamicEndpointSnitch', 'Severity']
     ]:
         if objectclass in datadict:
@@ -795,8 +893,13 @@ def update_data(datadict, endpoint, *args):
                 average = MovingAverages()
             average.add(datadict[objectclass][attribute])
             datadict[objectclass][attribute] = average
+    if HINT_STATISTICS in datadict:
+        d_size = datadict[HINT_STATISTICS]['MemtableDataSize']
+        if d_size:
+            d_size = d_size / datadict[HINT_STATISTICS]['MeanRowSize']
+        endpoints[endpoint][HINTS] = d_size
     endpoints[endpoint].update(datadict)
-    #logging.debug('%s: %s', endpoint, pprint.pformat(endpoints[endpoint]))
+    # logging.debug('%s: %s', endpoint, pprint.pformat(endpoints[endpoint]))
     return
 
 
@@ -839,7 +942,7 @@ def main():
     try:
         # add screen object as a reader to the reactor
         lc = LoopingCall(schedule_cluster, options, screen)
-        lc.start(0.25, True)
+        lc.start(0.5, True)
         reactor.addReader(screen)
         if options.debug:
             import twisted.manhole.telnet
