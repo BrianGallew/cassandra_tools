@@ -261,7 +261,8 @@ class Screen(object):
         self.red = curses.color_pair(3)
 
         self.updateSize()
-        self.stdscr.refresh()
+        lc = LoopingCall(self.refresh)
+        lc.start(0.25)
 
     def fileno(self):
         """ Mandatory twisted function so polling on FD 0 works """
@@ -482,8 +483,8 @@ class Screen(object):
             return
 
         row = self.rows - 1
-        status_message = 'Update frequency: %ds (%0.2f) %d' % (
-            update_delay, end_time - start_time, deferred_count)
+        status_message = 'Update frequency: %ds (%0.2f)' % (
+            update_delay, end_time - start_time)
         status_message = status_message[:self.cols]
         len_status_message = len(status_message)
         self.stdscr.addstr(
@@ -568,10 +569,15 @@ class Screen(object):
                 self.header_data[DEAD_NODES] += 1
                 self.header_data[LIVE_NODES] -= 1
         self.cluster_compaction_averages.add(compactions)
+        pass
+
+    def refresh(self):
+        '''Call all the functions required to re-draw the screen.'''
         self.paintStatus()
+        if not self.header_data:
+            return  # First run
         self.paintHeader()
         self.current_function()
-        pass
 
     @log_exceptions()
     def paintHelp(self):
