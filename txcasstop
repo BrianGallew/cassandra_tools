@@ -902,8 +902,11 @@ def update_data(datadict, endpoint, *args):
             datadict[objectclass][attribute] = average
     if HINT_STATISTICS in datadict:
         d_size = datadict[HINT_STATISTICS]['MemtableDataSize']
-        if d_size:
+        d_mean_size = datadict[HINT_STATISTICS]['MeanRowSize']
+        if d_size and d_mean_size:
             d_size = d_size / datadict[HINT_STATISTICS]['MeanRowSize']
+        else:
+            d_size = 0
         endpoints[endpoint][HINTS] = d_size
     endpoints[endpoint].update(datadict)
     # logging.debug('%s: %s', endpoint, pprint.pformat(endpoints[endpoint]))
