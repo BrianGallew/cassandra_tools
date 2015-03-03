@@ -277,7 +277,7 @@ class Screen(object):
         '''
         return 'CursesClient'
 
-    def addstr(self, y, x, msg, attributes=None):
+    def old_addstr(self, y, x, msg, attributes=None):
         'DRY wrapper for drawing strings'
         if not self.rows > y + 1:
             return False
@@ -287,6 +287,47 @@ class Screen(object):
             self.stdscr.addnstr(y, x, msg, self.cols - x - 1, attributes)
         else:
             self.stdscr.addnstr(y, x, msg, self.cols - x - 1)
+        return True
+
+    def addstr(self, *args, **kwargs):
+        'DRY wrapper for drawing strings'
+        # We only take a single kw argument
+        attributes = kwargs.pop('attributes', None)
+
+        # set up all the rest of the arguements
+        if len(args) == 0:
+            raise SyntaxError('Not enough arguments')
+        elif len(args) == 1:
+            msg = args[0]
+            y, x = self.stdscr.getyx()
+            max_write_len = len(msg)
+        elif len(args) == 2:
+            msg = args[0]
+            y, x = self.stdscr.getyx()
+            max_write_len = args[1]
+        elif len(args) == 3:
+            y = args[0]
+            x = args[1]
+            msg = args[2]
+            max_write_len = len(msg)
+        elif len(args) == 4:
+            y = args[0]
+            x = args[1]
+            msg = args[2]
+            max_write_len = args[3]
+        else:
+            raise SyntaxError('Too many arguments')
+
+        if not self.rows > y + 1:
+            return False
+        if not self.cols > x + 1:
+            return False
+        if max_write_len > (self.cols - x - 1):
+            max_write_len = self.cols - x - 1
+        if attributes:
+            self.stdscr.addnstr(y, x, msg, max_write_len, attributes)
+        else:
+            self.stdscr.addnstr(y, x, msg, max_write_len)
         return True
 
     def updateSize(self, *_):
@@ -332,17 +373,17 @@ class Screen(object):
         self.stdscr.clrtoeol()
 
         # Nodes
-        self.addstr(0, 0, 'Nodes:', curses.A_BOLD)
+        self.addstr(0, 0, 'Nodes:', attributes=curses.A_BOLD)
         y, x = self.stdscr.getyx()
         self.addstr(
-            y, x + 1, str(self.header_data[LIVE_NODES]) + '/', self.normal)
+            y, x + 1, str(self.header_data[LIVE_NODES]) + '/', attributes=self.normal)
         if self.header_data[DEAD_NODES]:
             attributes = self.red | curses.A_BOLD
         else:
             attributes = self.normal
         y, x = self.stdscr.getyx()
         self.addstr(
-            y, x, str(self.header_data[DEAD_NODES]), attributes)
+            y, x, str(self.header_data[DEAD_NODES]), attributes=attributes)
 
         # Hints!
         if self.header_data[HINTS]:
@@ -352,13 +393,13 @@ class Screen(object):
                 attributes = self.yellow
         else:
             attributes = self.normal
-        self.addstr(0, 13, 'Hints: ', curses.A_BOLD)
+        self.addstr(0, 13, 'Hints: ', attributes=curses.A_BOLD)
         y, x = self.stdscr.getyx()
         self.addstr(
-            y, x, humanize(self.header_data[HINTS], suffix=''), attributes)
+            y, x, humanize(self.header_data[HINTS], suffix=''), attributes=attributes)
 
         # Read rate
-        self.addstr(y, 35, 'Rrate:', curses.A_BOLD)
+        self.addstr(y, 35, 'Rrate:', attributes=curses.A_BOLD)
         y, x = self.stdscr.getyx()
         self.addstr(y, x + 1, '%d/%d/%d' % (
             self.header_data[READ_ONE],
@@ -367,7 +408,7 @@ class Screen(object):
         ))
 
         # Read latency
-        self.addstr(y, 65, 'RLatency:', curses.A_BOLD)
+        self.addstr(y, 65, 'RLatency:', attributes=curses.A_BOLD)
         y, x = self.stdscr.getyx()
         self.addstr(y, x + 1, '%0.2f/%0.2f/%0.2f' % (
             self.header_data[LREAD_ONE],
@@ -376,12 +417,12 @@ class Screen(object):
         ))
 
         # row 2
-        self.addstr(1, 0, 'Compactions:', curses.A_BOLD)
+        self.addstr(1, 0, 'Compactions:', attributes=curses.A_BOLD)
         y, x = self.stdscr.getyx()
         self.addstr(
-            y, x + 1, '%0.2f/%0.2f/%0.2f' % self.cluster_compaction_averages.get_all(), self.normal)
+            y, x + 1, '%0.2f/%0.2f/%0.2f' % self.cluster_compaction_averages.get_all(), attributes=self.normal)
 
-        self.addstr(y, 35, 'Wrate:', curses.A_BOLD)
+        self.addstr(y, 35, 'Wrate:', attributes=curses.A_BOLD)
         y, x = self.stdscr.getyx()
         self.addstr(y, x + 1, '%d/%d/%d' % (
             self.header_data[WRITE_ONE],
@@ -389,7 +430,7 @@ class Screen(object):
             self.header_data[WRITE_FIFTEEN]
         ))
 
-        self.addstr(y, 65, 'WLatency:', curses.A_BOLD)
+        self.addstr(y, 65, 'WLatency:', attributes=curses.A_BOLD)
         y, x = self.stdscr.getyx()
         self.addstr(y, x + 1, '%0.2f/%0.2f/%0.2f' % (
             self.header_data[LWRITE_ONE],
@@ -411,9 +452,9 @@ class Screen(object):
         for idx, label in enumerate([' DC', 'Nodes ', 'Racks', '   Load', ' Comps', 'Rlat', 'Rrate', 'Wlat', 'Wrate', '    Hints']):
             if idx == self.sort_key:
                 self.addstr(
-                    y, columns[idx], label, curses.A_BOLD | self.green)
+                    y, columns[idx], label, attributes=(curses.A_BOLD | self.green))
             else:
-                self.addstr(y, columns[idx], label, curses.A_BOLD)
+                self.addstr(y, columns[idx], label, attributes=curses.A_BOLD)
         for key in key_list:
             y += 1
             self.stdscr.move(y, 0)
