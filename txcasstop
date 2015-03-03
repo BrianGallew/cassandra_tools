@@ -30,18 +30,20 @@ import signal
 import termios
 import pprint
 import types
-from log_exceptions import log_exceptions  # Debugging tool
 import traceback
 # Yay, Twisted!
 from twisted.internet import reactor
 from twisted.internet.task import LoopingCall
+from twisted.internet.defer import DeferredList
 from twisted.web.client import getPage
 from twisted.internet.error import ReactorNotRunning
 
 # Globals are bad and I should be ashamed.  But they're so *useful*!
 endpoints = {}                  # All Cassandra endpoints
+dc_rollups = {}
 start_time = 0
 end_time = time.time()
+duration = 0
 update_delay = 3
 deferred_count = 0
 
@@ -50,6 +52,7 @@ ATTRIBUTE = 'Attribute'
 CLASSNAME = '@classname'
 NAME = '@name'
 VALUE = '@value'
+TYPE = '@type'
 LIVE_NODES = 'Live Nodes'
 DEAD_NODES = 'Dead Nodes'
 READ_ONE = 'Read One Minute Rate'
@@ -69,6 +72,7 @@ ONE_MINUTE_RATE = 'OneMinuteRate'
 FIVE_MINUTE_RATE = 'FiveMinuteRate'
 FIFTEEN_MINUTE_RATE = 'FifteenMinuteRate'
 HINTS = 'Hints'
+PREVIOUS_HINTS = 'Previous Hint Count'
 DATACENTER = 'DC'
 RACK = 'RACK'
 COMPACTIONS = 'Compactions'
@@ -84,7 +88,6 @@ STORAGE_SERVICE = 'org.apache.cassandra.db:type=StorageService'
 # {fa2f0653-4de6-384c-bf3e-96e26fea39db=[10.12.26.132], f0de9586-91cf-30e7-8bd9-e056decd502d=[10.12.26.134, 10.12.26.133], a0be4aed-d3b4-35f9-8346-96c1db58518f=[10.12.26.135]}
 
 
-@log_exceptions()
 def string_to_map(data, extra):
     '''Convert a string containing a java.lang.Map to a dictionary
     '''
@@ -104,7 +107,6 @@ def string_to_map(data, extra):
     return map_value
 
 
-@log_exceptions()
 def extract_compactions(data_block):
     '''Compactions are a little annoying to extract by virtue of the fact that
     they are composed of two "values": PendingTasks and Compactions.  This
@@ -144,26 +146,26 @@ def add_summary(functions, key, summary, max_sort_key):
     '''
     def real_decorator(func):
         '''Update the  dictionary.'''
-        functions[key] = func
+        functions[key] = func.__name__
         func.summary = summary
         func.max_sort_key = max_sort_key
         return func
     return real_decorator
 
 
-def humanize(number, format_string='{VALUE:>6.2f} {LABEL}'):
+def humanize(number, format_string='{VALUE:>6.2f} {LABEL}', suffix='B'):
     '''(Maybe) Convert B (bytes) to the appropriate SI unit
     :param number: number of bytes
     :param format_string: output format
     :returns: formatted string
     '''
-    label = 'B'
-    for l in ['KB', 'MB', 'GB', 'TB', 'PB']:
+    label = ''
+    for l in ['K', 'M', 'G', 'T', 'P']:
         if number < 1024:
             break
         number = number / 1024.0
         label = l
-    return format_string.format(VALUE=number, LABEL=label)
+    return format_string.format(VALUE=number, LABEL=label + suffix)
 
 
 class MovingAverages(object):
@@ -175,7 +177,6 @@ class MovingAverages(object):
         self.one = self.five = self.fifteen = 0.0
         return
 
-    @log_exceptions()
     def add(self, value):
         '''Add a new value, timestamped appropriately.  Throw away any old
         values, then re-compute the moving averages.'''
@@ -215,7 +216,6 @@ class MovingAverages(object):
         self.fifteen = total / count
         return self
 
-    @log_exceptions()
     def get_all(self):
         '''Return all three averages
         '''
@@ -230,7 +230,6 @@ class Screen(object):
     cols = 0
     header_data = {}
     screen_data = {}
-    ring_name = ''
     help = False
     help_indicator = " Press '?' for help"
     sort_key = 0
@@ -238,9 +237,12 @@ class Screen(object):
     cluster_compaction_averages = MovingAverages()
     closed = False
 
-    def __init__(self):
+    def __init__(self, ring_name):
         '''Initialize Curses and do the first screen painting.
         '''
+        sys.stdout.write(']0;Cassandra Top - %s' % ring_name)
+        # Set up initial "current screen painting function"
+        self.current_function = self.paintClusterRollup
         # set screen attributes
         self.old_tty = termios.tcgetattr(sys.stdin.fileno())
         self.stdscr = curses.initscr()  # initialize curses
@@ -259,6 +261,8 @@ class Screen(object):
         self.green = curses.color_pair(2)
         curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
         self.red = curses.color_pair(3)
+        curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+        self.yellow = curses.color_pair(4)
 
         self.updateSize()
         lc = LoopingCall(self.refresh)
@@ -273,7 +277,6 @@ class Screen(object):
         '''
         return 'CursesClient'
 
-    @log_exceptions()
     def addstr(self, y, x, msg, attributes=None):
         'DRY wrapper for drawing strings'
         if not self.rows > y + 1:
@@ -286,7 +289,6 @@ class Screen(object):
             self.stdscr.addnstr(y, x, msg, self.cols - x - 1)
         return True
 
-    @log_exceptions()
     def updateSize(self, *_):
         '''SIGWINCH handler'''
         curses.endwin()
@@ -319,7 +321,6 @@ class Screen(object):
             pass
         return
 
-    @log_exceptions()
     def paintHeader(self):
         '''Display the cluster summary data at the top of the screen: node counts
         '''
@@ -329,6 +330,8 @@ class Screen(object):
         self.stdscr.clrtoeol()
         self.stdscr.move(1, 0)
         self.stdscr.clrtoeol()
+
+        # Nodes
         self.addstr(0, 0, 'Nodes:', curses.A_BOLD)
         y, x = self.stdscr.getyx()
         self.addstr(
@@ -341,6 +344,20 @@ class Screen(object):
         self.addstr(
             y, x, str(self.header_data[DEAD_NODES]), attributes)
 
+        # Hints!
+        if self.header_data[HINTS]:
+            if self.header_data[HINTS] > self.header_data[PREVIOUS_HINTS]:
+                attributes = self.red | curses.A_BOLD
+            else:
+                attributes = self.yellow
+        else:
+            attributes = self.normal
+        self.addstr(0, 13, 'Hints: ', curses.A_BOLD)
+        y, x = self.stdscr.getyx()
+        self.addstr(
+            y, x, humanize(self.header_data[HINTS], suffix=''), attributes)
+
+        # Read rate
         self.addstr(y, 35, 'Rrate:', curses.A_BOLD)
         y, x = self.stdscr.getyx()
         self.addstr(y, x + 1, '%d/%d/%d' % (
@@ -349,6 +366,7 @@ class Screen(object):
             self.header_data[READ_FIFTEEN]
         ))
 
+        # Read latency
         self.addstr(y, 65, 'RLatency:', curses.A_BOLD)
         y, x = self.stdscr.getyx()
         self.addstr(y, x + 1, '%0.2f/%0.2f/%0.2f' % (
@@ -384,56 +402,13 @@ class Screen(object):
         'Display cluster summary data'
         self.sort_key = self.sort_key % (
             self.current_function.max_sort_key + 1)
-        database = {}
-        columns = [0, 6, 12, 18, 28, 36, 42, 50, 56]
+        columns = [0, 6, 12, 18, 28, 36, 42, 50, 56, 62]
         formats = ['{0:s}', '{0:^5s}', '{0:^5d}', '{0:>9s}',
-                   '{0:>6.2f}', '{0:>4.2f}', '{0:>5.0f}', '{0:>4.2f}', '{0:>5.0f}']
-        for endpoint in endpoints:
-            host_data = endpoints[endpoint]
-            if not host_data:
-                return
-            logging.debug('host_data: %s', str(host_data.keys()))
-            if not host_data[DATACENTER] in database:
-                # Do it this way because setdefault doesn't do what I want.
-                database[host_data[DATACENTER]] = [
-                    host_data[DATACENTER], 0, 0, {}, 0.0, 0.0, 0, 0, 0, 0]
-            try:
-                current_group = database[host_data[DATACENTER]]
-                current_group[3][host_data[RACK]] = 0
-                current_group[4] += host_data[STORAGE_SERVICE]['Load']
-                current_group[5] += host_data[COMPACTIONS]
-                current_group[
-                    6] += host_data[CLIENT_READ_LATENCY][SEVENTY_FIFTH].get_all()[0]
-                current_group[
-                    7] += host_data[CLIENT_READ_LATENCY][ONE_MINUTE_RATE]
-                current_group[
-                    8] += host_data[CLIENT_WRITE_LATENCY][SEVENTY_FIFTH].get_all()[0]
-                current_group[
-                    9] += host_data[CLIENT_WRITE_LATENCY][ONE_MINUTE_RATE]
-                # Do this last, as an exception anywhere above should turn this
-                # into a dead node
-                current_group[1] += 1
-            except Exception as e:
-                logging.warn('%s: %s', e, str(current_group))
-                current_group[2] += 1
-        # reformat the data a little
-        for key in database.keys():
-            # combine fields 1 and 2
-            database[key][1] = "%d/%d" % (database[key][1], database[key][2])
-            del database[key][2]
-            # change this to a count of unique racks
-            database[key][2] = len(database[key][2])
-            # Make this number human-readable
-            database[key][3] = humanize(database[key][3])
-            # Fix latency numbers
-            database[key][5] = database[key][5] / 100000
-            database[key][7] = database[key][7] / 100000
-        # Sort the data on the appropriate column.  Not all columns really
-        # make sense, but this is easy this way.
-        key_list = sorted(database.keys(), lambda x, y: cmp(
-            database[y][self.sort_key], database[x][self.sort_key]))
+                   '{0:>6.2f}', '{0:>4.2f}', '{0:>5.0f}', '{0:>4.2f}', '{0:>5.0f}', '{0:>9s}']
+        key_list = sorted(dc_rollups.keys(), lambda x, y: cmp(
+            dc_rollups[y][self.sort_key], dc_rollups[x][self.sort_key]))
         y = 3
-        for idx, label in enumerate([' DC', 'Nodes ', 'Racks', '   Load', ' Comps', 'Rlat', 'Rrate', 'Wlat', 'Wrate']):
+        for idx, label in enumerate([' DC', 'Nodes ', 'Racks', '   Load', ' Comps', 'Rlat', 'Rrate', 'Wlat', 'Wrate', '    Hints']):
             if idx == self.sort_key:
                 self.addstr(
                     y, columns[idx], label, curses.A_BOLD | self.green)
@@ -442,10 +417,9 @@ class Screen(object):
         for key in key_list:
             y += 1
             self.stdscr.move(y, 0)
-            for idx, item in enumerate(database[key]):
+            for idx, item in enumerate(dc_rollups[key]):
                 self.addstr(y, columns[idx], formats[idx].format(item))
         pass
-    current_function = paintClusterRollup  # This is where the magic happens!
 
     @add_summary(functions, 'h', 'Host Data', 9)
     def paintHostData(self):
@@ -472,7 +446,6 @@ class Screen(object):
         'Display write data'
         pass
 
-    @log_exceptions()
     def paintStatus(self):
         '''Paint the status line at the bottom of the screen.
         Refresh schedule/time, current display mode, and help prompt.
@@ -483,8 +456,8 @@ class Screen(object):
             return
 
         row = self.rows - 1
-        status_message = 'Update frequency: %ds (%0.2f)' % (
-            update_delay, end_time - start_time)
+        status_message = 'Update frequency: %ds (%0.2f) %d outstanding queries' % (
+            update_delay, duration, deferred_count)
         status_message = status_message[:self.cols]
         len_status_message = len(status_message)
         self.stdscr.addstr(
@@ -499,17 +472,11 @@ class Screen(object):
             row, self.cols - len_help_indicator - 1, self.help_indicator, self.inverse)
         self.stdscr.refresh()
 
-    @log_exceptions()
     def reload_data(self):
         '''Re-load all cumulative data.'''
         logging.debug('reload_data: %s', str(endpoints))
         if not endpoints:
             return  # First run
-        if not self.ring_name:
-            key = endpoints.keys()[0]
-            self.ring_name = endpoints[key].get(
-                STORAGE_SERVICE, {}).get('ClusterName', '')
-            sys.stdout.write(']0;Cassandra Top - %s' % self.ring_name)
 
         # Start with a blank slate for header data every time.
         self.header_data[LIVE_NODES] = len(endpoints)
@@ -526,60 +493,107 @@ class Screen(object):
         self.header_data[LWRITE_ONE] = 0.0
         self.header_data[LWRITE_FIVE] = 0.0
         self.header_data[LWRITE_FIFTEEN] = 0.0
+        self.header_data[HINTS] = 0
+        self.header_data[PREVIOUS_HINTS] = 0
         compactions = 0
 
         # Now loop through the data for each end point and update the various
         # accumulators
+        dc_rollups.clear()
         for node in endpoints:
             try:
                 data_block = endpoints[node]
                 if not CLIENT_READ_LATENCY in data_block:
                     continue
-                compactions += extract_compactions(data_block)
+                single_host_compactions = extract_compactions(data_block)
+                compactions += single_host_compactions
+                our_dc = data_block[DATACENTER]
+                if not our_dc in dc_rollups:
+                    # Do it this way because setdefault doesn't do what I want.
+                    dc_rollups[our_dc] = [
+                        our_dc, 0, 0, {}, 0.0, 0.0, 0, 0, 0, 0, 0]
+                current_group = dc_rollups[our_dc]
+                current_group[5] += single_host_compactions
+                current_group[3][data_block[RACK]] = 0
                 # Latencies
                 one, five, fifteen = data_block[
                     CLIENT_READ_LATENCY][SEVENTY_FIFTH].get_all()
                 self.header_data[LREAD_ONE] += one / 100000
                 self.header_data[LREAD_FIVE] += five / 100000
                 self.header_data[LREAD_FIFTEEN] += fifteen / 100000
+                current_group[6] += one / 100000
 
                 one, five, fifteen = data_block[
                     CLIENT_WRITE_LATENCY][SEVENTY_FIFTH].get_all()
                 self.header_data[LWRITE_ONE] += one / 100000
                 self.header_data[LWRITE_FIVE] += five / 100000
                 self.header_data[LWRITE_FIFTEEN] += fifteen / 100000
+                current_group[8] += one / 100000
 
                 # Rates
-                self.header_data[READ_ONE] += data_block[
+                one_minute_rate = data_block[
                     CLIENT_READ_LATENCY][ONE_MINUTE_RATE]
+                self.header_data[READ_ONE] += one_minute_rate
+                current_group[7] += one_minute_rate
                 self.header_data[READ_FIVE] += data_block[
                     CLIENT_READ_LATENCY][FIVE_MINUTE_RATE]
                 self.header_data[READ_FIFTEEN] += data_block[
                     CLIENT_READ_LATENCY][FIFTEEN_MINUTE_RATE]
 
-                self.header_data[WRITE_ONE] += data_block[
+                one_minute_rate = data_block[
                     CLIENT_WRITE_LATENCY][ONE_MINUTE_RATE]
+                self.header_data[WRITE_ONE] += one_minute_rate
                 self.header_data[WRITE_FIVE] += data_block[
                     CLIENT_WRITE_LATENCY][FIVE_MINUTE_RATE]
                 self.header_data[WRITE_FIFTEEN] += data_block[
                     CLIENT_WRITE_LATENCY][FIFTEEN_MINUTE_RATE]
+                current_group[9] += one_minute_rate
+
+                # Hints
+                self.header_data[HINTS] += data_block[HINTS]
+                self.header_data[PREVIOUS_HINTS] += data_block[PREVIOUS_HINTS]
+
+                current_group[4] += data_block[STORAGE_SERVICE]['Load']
+                current_group[
+                    10] += data_block[HINTS]
+                # Do this last, as an exception anywhere above should turn this
+                # into a dead node
+                current_group[1] += 1
 
             except Exception as e:
                 logging.critical(traceback.format_exc())
                 self.header_data[DEAD_NODES] += 1
                 self.header_data[LIVE_NODES] -= 1
+                current_group[2] += 1
+                logging.warn(
+                    'paintClusterRollup: %s - %s', str(e), str(current_group))
+        # reformat the data a little
+        for key in dc_rollups.keys():
+            # combine fields 1 and 2
+            dc_rollups[key][
+                1] = "%d/%d" % (dc_rollups[key][1], dc_rollups[key][2])
+            del dc_rollups[key][2]
+            # change this to a count of unique racks
+            dc_rollups[key][2] = len(dc_rollups[key][2])
+            # Make this number human-readable
+            dc_rollups[key][3] = humanize(dc_rollups[key][3])
+            # Fix latency numbers
+            dc_rollups[key][5] = dc_rollups[key][5] / 100000
+            dc_rollups[key][7] = dc_rollups[key][7] / 100000
+            dc_rollups[key][9] = humanize(dc_rollups[key][9], suffix='')
+        # Sort the data on the appropriate column.  Not all columns really
+        # make sense, but this is easy this way.
         self.cluster_compaction_averages.add(compactions)
         pass
 
     def refresh(self):
         '''Call all the functions required to re-draw the screen.'''
         self.paintStatus()
-        if not self.header_data:
+        if not duration:
             return  # First run
         self.paintHeader()
         self.current_function()
 
-    @log_exceptions()
     def paintHelp(self):
         '''Draw the help page.  Try to keep the helpstrings up to date and meaningfull.
         '''
@@ -621,7 +635,6 @@ class Screen(object):
         helpscr.refresh()
         self.help = helpscr
 
-    @log_exceptions()
     def doRead(self):
         """ Input is ready! """
         global update_delay
@@ -647,8 +660,8 @@ class Screen(object):
             if update_delay > 1:
                 update_delay -= 1
         elif key in self.functions:  # This is managed by a decorator
-            self.current_function = self.functions[key]
-            self.current_function(self)
+            self.current_function = getattr(self, self.functions[key])
+            self.current_function()
         elif key in '1234567890':
             value = (int(key) - 1 + 10) % 10  # Convert to [0..9]
             if self.current_function.max_sort_key > value - 1:
@@ -695,16 +708,38 @@ def setup_logging(option_group):
     return
 
 
-@log_exceptions()
+def build_url(host, port, objectname, attribute=None):
+    if attribute:
+        operation = '/getattribute?attribute=%s&operation=getattribute' % attribute
+    else:
+        operation = '/mbean?operations=false&constructors=false&notifications=false'
+    return ''.join(['http://',
+                    host, ':', str(port),
+                    operation,
+                    '&objectname=', objectname,
+                    '&template=identity'])
+
+
 def register_hosts(option_group):
     '''Sets up the global list of hosts.
+    :param option_group: CLI options
+    :returns: cluster name
     '''
-    url = 'http://' + option_group.seed_host + ':' + str(option_group.mx4j_port) + '/getattribute?' + \
-        'objectname=org.apache.cassandra.net:type=FailureDetector' + \
-        '&attribute=AllEndpointStates' + \
-        '&operation=getattribute' + '&template=identity'
-    ring_data = xmltodict.parse(urllib2.urlopen(url, None, 30))
-    value = ring_data['MBean']['Attribute'][VALUE]
+    global cluster_name
+    url = build_url(option_group.seed_host,
+                    option_group.mx4j_port,
+                    'org.apache.cassandra.net:type=FailureDetector',
+                    'AllEndpointStates')
+    logging.critical(url)
+    try:
+        raw_data = urllib2.urlopen(url, None, 30).read()
+        ring_data = xmltodict.parse(raw_data)
+        logging.info('Received %d bytes', len(raw_data))
+        value = ring_data['MBean']['Attribute'][VALUE]
+    except Exception as the_exception:
+        logging.fatal('Unable to load the initial data: %s', the_exception)
+        exit(1)
+
     for row in re.split('^/', value, flags=re.MULTILINE):
         if not row:
             continue
@@ -727,52 +762,105 @@ def register_hosts(option_group):
                 host_data[RACK] = row_pieces[1].strip()
         logging.debug(
             'register_hosts: %s', str(host_data))
-
     logging.info(str(endpoints))
+    # get cluster name
+    url = build_url(option_group.seed_host,
+                    option_group.mx4j_port,
+                    STORAGE_SERVICE,
+                    'ClusterName')
+    raw_data = urllib2.urlopen(url, None, 30).read()
+    ring_data = xmltodict.parse(raw_data)
+    return ring_data['MBean']['Attribute']['@value']
 
 
-@log_exceptions()
 def schedule_cluster(option_group, screen):
     '''Schedule calls of all cluster data'''
     # First, update the cluster display to the current state.
-    global start_time, deferred_count
+    global start_time
     if deferred_count:
         return
     now = time.time()
     current_delay = now - start_time
     if current_delay < update_delay:
         return
-    screen.reload_data()
     logging.info('Took %f seconds to reload the screen', time.time() - now)
     # Now, set up Deferreds for all of the URLs that need to be gotten.
     start_time = now
     all_deferreds = []
     for endpoint in endpoints:
-        url = 'http://%s:%s/mbean?template=identity&operations=false&constructors=false&notifications=false&objectname=' % (
-            endpoint, option_group.mx4j_port)
         for query in [
                 COMPACTION_MANAGER,
-                STORAGE_SERVICE,
                 CLIENT_READ_LATENCY,
                 CLIENT_WRITE_LATENCY,
                 HINT_STATISTICS,
                 CLIENT_RANGE_LATENCY,
         ]:
-            logging.debug('dispatching GET for %s', url + query)
-            deferred = getPage(url + query, timeout=4)
-            deferred.addCallback(parse_data)
-            deferred.addCallbacks(update_data,
-                                  no_update_data, callbackArgs=(endpoint,))
-            all_deferreds.append(deferred)
-            deferred_count += 1
+            url = build_url(endpoint, option_group.mx4j_port, query)
+            logging.debug('dispatching GET for %s', url)
+            all_deferreds.append(timeout_getPage(url, endpoint))
+        url = build_url(endpoint,
+                        option_group.mx4j_port,
+                        STORAGE_SERVICE,
+                        'Load')
+        logging.debug('dispatching GET for %s', url)
+        all_deferreds.append(timeout_getPage(url, endpoint))
+
+    deferred = DeferredList(all_deferreds)
+    deferred.addCallback(update_endtime, screen)
     return
+
+
+def update_endtime(_, screen):
+    global end_time, duration
+    end_time = time.time()
+    duration = end_time - start_time
+    screen.reload_data()
+    return
+
+
+def timeout_getPage(url, endpoint):
+    '''The timeout keyward argument for getPage only applies to the initial
+    connection.  Once the web server responds, the deferred will wait
+    forever for the response to complete, even in the face of hung threads,
+    etc.  This will not do.
+    :param url: URL to retreive
+    :param endpoint: hostname (needed for one of the callbacks)
+    :returns: deferred
+
+    '''
+    global deferred_count
+    deferred = getPage(url)
+
+    def suicide_pact():
+        global deferred_count
+        deferred_count -= 1
+        # instead of calling deferred.cancel(), frob the values directly
+        # because we DO NOT WANT the deferred to fire any
+        # callbacks/errbacks.
+        deferred._suppressAlreadyCalled = True
+        deferred.called = True
+
+        logging.warn(
+            'request for %s cancelled after %02f seconds', url, time.time() - start_time)
+        return
+
+    partner_in_crime = reactor.callLater(update_delay - 0.75, suicide_pact)
+
+    def cancel_and_pass_thru(args):
+        partner_in_crime.cancel()
+        return args
+    deferred.addCallback(cancel_and_pass_thru)
+    deferred.addCallback(parse_data)
+    deferred.addCallbacks(update_data,
+                          no_update_data, callbackArgs=(endpoint,))
+    deferred_count += 1
+    return deferred
 
 
 def no_update_data(result):
     logging.info(result)
 
 
-@log_exceptions()
 def type_convertor(data_type, data_value):
     '''Convert Java types into Python types.  This is incomplete, but meh.
     '''
@@ -814,19 +902,18 @@ def type_convertor(data_type, data_value):
         else:
             # I don't care about any of the remaining types at this
             # point.  I hope.
-            logging.info('Unknown type: %s:%s', data_type, data_value)
+            logging.debug('Unknown type: %s:%s', data_type, data_value)
     except Exception as e:
         logging.info(
             'Exception processing: %s:"%s" (%s)', data_type, data_value, e)
     return retval
 
 
-@log_exceptions()
 def parse_one_attribute(bean, data):
     label = bean['@objectname']
     # SchemaVersions is ... special.
-    if NAME in bean and bean[NAME] == 'SchemaVersions':
-        data['SchemaVersions'] = bean[VALUE]
+    if NAME in bean and bean[NAME] in ['SchemaVersions', 'Load']:
+        data[label][bean[NAME]] = bean[VALUE]
         return
     data[label] = {}
     a_type = type(bean[ATTRIBUTE])
@@ -834,28 +921,33 @@ def parse_one_attribute(bean, data):
         for data_item in bean[ATTRIBUTE]:
             try:
                 data[label][data_item[NAME]] = type_convertor(
-                    data_item['@type'], data_item[VALUE])
+                    data_item[TYPE], data_item[VALUE])
                 logging.debug(
                     '%s:%s', label, data[label][data_item[NAME]])
-            except:
+            except Exception as the_exception:
                 logging.warn(
-                    'Error converting %s:%s', bean['@objectname'], data_item)
+                    'Error converting from list %s:%s ===%s===', bean['@objectname'], data_item, the_exception)
     elif a_type == collections.OrderedDict:
         data_item = bean[ATTRIBUTE]
         try:
-            destination[label][data_item[NAME]] = type_convertor(
-                data_item['@type'], data_item[VALUE])
-            logging.debug(
-                'FOO - %s:%s:%s:%s', label, destination[label][data_item[NAME]], data_item['@type'], data_item[VALUE])
-        except:
+            if TYPE in data_item:
+                data[label][data_item[NAME]] = type_convertor(
+                    data_item[TYPE], data_item[VALUE])
+                logging.debug(
+                    'FOO - %s:%s:%s:%s', label, data[label][data_item[NAME]], data_item[TYPE], data_item[VALUE])
+            else:
+                data[label][data_item[NAME]] = type_convertor(
+                    data_item[CLASSNAME], data_item[VALUE])
+                logging.debug(
+                    'FOO - %s:%s:%s:%s', label, data[label][data_item[NAME]], data_item[CLASSNAME], data_item[VALUE])
+        except Exception as the_exception:
             logging.warn(
-                'Error converting %s:%s', bean['@objectname'], data_item)
+                'Error converting from ordered dict %s:%s ===%s===', bean, data_item, the_exception)
     else:
         logging.critical(
             'No handler for %s: type %s', str(bean), a_type)
 
 
-@log_exceptions()
 def parse_data(xml_blob):
     '''Take all that wonderful XML and turn it into a dictionary of Python
     types.  In theory, if things were structured a bit differently,
@@ -865,6 +957,7 @@ def parse_data(xml_blob):
     '''
     global end_time, deferred_count
     deferred_count -= 1
+    logging.info('Received %d bytes', len(xml_blob))
     data = xmltodict.parse(xml_blob)
     for key in ['Server', 'MBean']:
         if key in data:
@@ -879,7 +972,6 @@ def parse_data(xml_blob):
     return converted_data
 
 
-@log_exceptions()
 def update_data(datadict, endpoint, *args):
     '''There are a few odd types in the master data that need to be updated
     intelligently rather than just being blindly overwritten.'''
@@ -902,18 +994,23 @@ def update_data(datadict, endpoint, *args):
             datadict[objectclass][attribute] = average
     if HINT_STATISTICS in datadict:
         d_size = datadict[HINT_STATISTICS]['MemtableDataSize']
+        live_disk = datadict[HINT_STATISTICS]['LiveDiskSpaceUsed']
+        compression = datadict[HINT_STATISTICS]['CompressionRatio']
+        if compression:
+            d_size = d_size + (live_disk / compression)
         d_mean_size = datadict[HINT_STATISTICS]['MeanRowSize']
         if d_size and d_mean_size:
             d_size = d_size / datadict[HINT_STATISTICS]['MeanRowSize']
         else:
             d_size = 0
+        endpoints[endpoint][PREVIOUS_HINTS] = endpoints[endpoint].get(HINTS, 0)
         endpoints[endpoint][HINTS] = d_size
     endpoints[endpoint].update(datadict)
-    # logging.debug('%s: %s', endpoint, pprint.pformat(endpoints[endpoint]))
+    logging.debug(
+        'update_data: %s: %s', endpoint, pprint.pformat(endpoints[endpoint]))
     return
 
 
-@log_exceptions()
 def cli():
     '''Put argument selection/parsing in here for neatness
     '''
@@ -940,15 +1037,13 @@ def cli():
     return options
 
 
-@log_exceptions()
 def main():
     """Primary entry point."""
     options = cli()
 
     # Your code here.
     print 'getting node list'
-    register_hosts(options)
-    screen = Screen()   # create Screen object
+    screen = Screen(register_hosts(options))  # create Screen object
     try:
         # add screen object as a reader to the reactor
         lc = LoopingCall(schedule_cluster, options, screen)
