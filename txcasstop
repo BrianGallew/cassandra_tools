@@ -76,6 +76,7 @@ PREVIOUS_HINTS = 'Previous Hint Count'
 DATACENTER = 'DC'
 RACK = 'RACK'
 COMPACTIONS = 'Compactions'
+STATUS = 'Status'
 
 CLIENT_RANGE_LATENCY = 'org.apache.cassandra.metrics:type=ClientRequest,scope=RangeSlice,name=Latency'
 CLIENT_READ_LATENCY = 'org.apache.cassandra.metrics:type=ClientRequest,scope=Read,name=Latency'
@@ -466,6 +467,61 @@ class Screen(object):
     @add_summary(functions, 'h', 'Host Data', 9)
     def paintHostData(self):
         'Display host data'
+        logging.debug('paintHostData')
+        self.sort_key = self.sort_key % (
+            self.current_function.max_sort_key + 1)
+        labels = ['Hostname  ', 'DC   ', 'Rack  ', 'Status   ', 'Load     ',
+                  'Comps  ', 'Rlat ', 'Rrate  ', 'Wlat ', 'Wrate     ', 'Hints']
+        format_string = '{0:s} {1:^5s} {2:^4s} {10:>6s} {3:>9s} {4:> 6.2f} {5:> 4.2f} {6:> 5.0f} {7:> 4.2f} {8:> 5.0f} {9:> 9.2f}'
+        local_data = []
+        # First, collect out the data we're going to draw.
+        for endpoint in endpoints:
+            try:
+                entry = endpoint.split('.')[:2]
+                entry.append(endpoints[endpoint][RACK])
+                entry.append(
+                    humanize(endpoints[endpoint][STORAGE_SERVICE]['Load']))
+                entry.append(endpoints[endpoint][COMPACTIONS])
+                entry.append(
+                    endpoints[endpoint][CLIENT_READ_LATENCY][ONE_MINUTE_RATE])
+                entry.append(
+                    endpoints[endpoint][CLIENT_READ_LATENCY][SEVENTY_FIFTH].get_all()[0])
+                entry.append(
+                    endpoints[endpoint][CLIENT_WRITE_LATENCY][ONE_MINUTE_RATE])
+                entry.append(
+                    endpoints[endpoint][CLIENT_WRITE_LATENCY][SEVENTY_FIFTH].get_all()[0])
+                entry.append(endpoints[endpoint][HINTS])
+                # Putting this at the end instead of in position 4 for sorting
+                # purposes
+                entry.append(
+                    endpoints[endpoint][STORAGE_SERVICE]['OperationMode'])
+
+            except Exception as the_exception:
+                logging.fatal(the_exception)
+                logging.fatal(str(endpoints[endpoint].keys()))
+            local_data.append(entry)
+        # Next, we need to sort it.
+        y = 3
+        try:
+            local_data = sorted(
+                local_data, lambda x, y: cmp(y[self.sort_key], x[self.sort_key]))
+            local_key = self.sort_key
+            if local_key > 2:
+                local_key += 1
+            self.stdscr.move(y, 0)
+            for idx, label in enumerate(labels):
+                if idx == local_key:
+                    self.addstr(
+                        label, attributes=(curses.A_BOLD | self.green))
+                else:
+                    self.addstr(
+                        label, attributes=curses.A_BOLD)
+            for row in local_data:
+                y += 1
+                self.addstr(y, 0, format_string.format(*row))
+        except Exception as the_exception:
+            logging.fatal(the_exception)
+
         pass
 
     @add_summary(functions, 's', 'Severity', 5)
@@ -846,6 +902,12 @@ def schedule_cluster(option_group, screen):
                         'Load')
         logging.debug('dispatching GET for %s', url)
         all_deferreds.append(timeout_getPage(url, endpoint))
+        status_url = build_url(endpoint,
+                               option_group.mx4j_port,
+                               STORAGE_SERVICE,
+                               'OperationMode')
+        logging.debug('dispatching GET for %s', status_url)
+        all_deferreds.append(timeout_getPage(status_url, endpoint))
 
     deferred = DeferredList(all_deferreds)
     deferred.addCallback(update_endtime, screen)
@@ -953,11 +1015,12 @@ def type_convertor(data_type, data_value):
 
 def parse_one_attribute(bean, data):
     label = bean['@objectname']
+    data[label] = {}
     # SchemaVersions is ... special.
-    if NAME in bean and bean[NAME] in ['SchemaVersions', 'Load']:
+    if NAME in bean and bean[NAME] in ['SchemaVersions', 'Load', 'OperationMode']:
+        logging.info('parse_one_attribute %s:%s', bean[NAME], bean[VALUE])
         data[label][bean[NAME]] = bean[VALUE]
         return
-    data[label] = {}
     a_type = type(bean[ATTRIBUTE])
     if a_type == types.ListType:
         for data_item in bean[ATTRIBUTE]:
@@ -976,12 +1039,12 @@ def parse_one_attribute(bean, data):
                 data[label][data_item[NAME]] = type_convertor(
                     data_item[TYPE], data_item[VALUE])
                 logging.debug(
-                    'FOO - %s:%s:%s:%s', label, data[label][data_item[NAME]], data_item[TYPE], data_item[VALUE])
+                    'parse_one_attribute - TYPE in OrderedDict - %s:%s:%s:%s', label, data[label][data_item[NAME]], data_item[TYPE], data_item[VALUE])
             else:
                 data[label][data_item[NAME]] = type_convertor(
                     data_item[CLASSNAME], data_item[VALUE])
                 logging.debug(
-                    'FOO - %s:%s:%s:%s', label, data[label][data_item[NAME]], data_item[CLASSNAME], data_item[VALUE])
+                    'parse_one_attribute - CLASSNAME in OrderedDict - %s:%s:%s:%s', label, data[label][data_item[NAME]], data_item[CLASSNAME], data_item[VALUE])
         except Exception as the_exception:
             logging.warn(
                 'Error converting from ordered dict %s:%s ===%s===', bean, data_item, the_exception)
@@ -1047,7 +1110,14 @@ def update_data(datadict, endpoint, *args):
             d_size = 0
         endpoints[endpoint][PREVIOUS_HINTS] = endpoints[endpoint].get(HINTS, 0)
         endpoints[endpoint][HINTS] = d_size
-    endpoints[endpoint].update(datadict)
+    # This used to be a simple foo.update(), but that doesn't work well with nested dicts.
+    # endpoints[endpoint]n.update(datadict)
+    for key in datadict:
+        value = datadict[key]
+        if type(value) == dict:
+            endpoints[endpoint].setdefault(key, {}).update(value)
+        else:
+            endpoints[endpoint][key] = value
     logging.debug(
         'update_data: %s: %s', endpoint, pprint.pformat(endpoints[endpoint]))
     return
