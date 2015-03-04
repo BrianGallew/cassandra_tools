@@ -374,16 +374,20 @@ class Screen(object):
 
         # Nodes
         self.addstr(0, 0, 'Nodes:', attributes=curses.A_BOLD)
-        y, x = self.stdscr.getyx()
-        self.addstr(
-            y, x + 1, str(self.header_data[LIVE_NODES]) + '/', attributes=self.normal)
         if self.header_data[DEAD_NODES]:
             attributes = self.red | curses.A_BOLD
         else:
             attributes = self.normal
-        y, x = self.stdscr.getyx()
-        self.addstr(
-            y, x, str(self.header_data[DEAD_NODES]), attributes=attributes)
+        # This string is to long to ensure that if the actual content ever
+        # shrinks we don't dend up with extra characters that never get
+        # erased.
+        display_string = ' {Live Nodes:d}/{Dead Nodes:d}      '.format(
+            **self.header_data)
+        if self.header_data[DEAD_NODES]:
+            attributes = self.red | curses.A_BOLD
+        else:
+            attributes = self.normal
+        self.addstr(display_string, 6, attributes=attributes)
 
         # Hints!
         if self.header_data[HINTS]:
@@ -393,46 +397,40 @@ class Screen(object):
                 attributes = self.yellow
         else:
             attributes = self.normal
-        self.addstr(0, 13, 'Hints: ', attributes=curses.A_BOLD)
-        y, x = self.stdscr.getyx()
+        self.addstr(' Hints: ', attributes=curses.A_BOLD)
         self.addstr(
-            y, x, humanize(self.header_data[HINTS], suffix=''), attributes=attributes)
+            humanize(self.header_data[HINTS], suffix='') + '          ', 14, attributes=attributes)
 
         # Read rate
-        self.addstr(y, 35, 'Rrate:', attributes=curses.A_BOLD)
-        y, x = self.stdscr.getyx()
-        self.addstr(y, x + 1, '%d/%d/%d' % (
+        self.addstr(' Rrate: ', attributes=curses.A_BOLD)
+        self.addstr('%d/%d/%d                  ' % (
             self.header_data[READ_ONE],
             self.header_data[READ_FIVE],
             self.header_data[READ_FIFTEEN]
-        ))
+        ), 22)
 
         # Read latency
-        self.addstr(y, 65, 'RLatency:', attributes=curses.A_BOLD)
-        y, x = self.stdscr.getyx()
-        self.addstr(y, x + 1, '%0.2f/%0.2f/%0.2f' % (
+        self.addstr(' RLatency: ', attributes=curses.A_BOLD)
+        self.addstr('%0.2f/%0.2f/%0.2f' % (
             self.header_data[LREAD_ONE],
             self.header_data[LREAD_FIVE],
             self.header_data[LREAD_FIFTEEN]
         ))
 
         # row 2
-        self.addstr(1, 0, 'Compactions:', attributes=curses.A_BOLD)
-        y, x = self.stdscr.getyx()
+        self.addstr(1, 0, 'Compactions: ', attributes=curses.A_BOLD)
         self.addstr(
-            y, x + 1, '%0.2f/%0.2f/%0.2f' % self.cluster_compaction_averages.get_all(), attributes=self.normal)
+            '%0.2f/%0.2f/%0.2f                    ' % self.cluster_compaction_averages.get_all(), 21, attributes=self.normal)
 
-        self.addstr(y, 35, 'Wrate:', attributes=curses.A_BOLD)
-        y, x = self.stdscr.getyx()
-        self.addstr(y, x + 1, '%d/%d/%d' % (
+        self.addstr(' Wrate: ', attributes=curses.A_BOLD)
+        self.addstr('%d/%d/%d                  ' % (
             self.header_data[WRITE_ONE],
             self.header_data[WRITE_FIVE],
             self.header_data[WRITE_FIFTEEN]
-        ))
+        ), 22)
 
-        self.addstr(y, 65, 'WLatency:', attributes=curses.A_BOLD)
-        y, x = self.stdscr.getyx()
-        self.addstr(y, x + 1, '%0.2f/%0.2f/%0.2f' % (
+        self.addstr(' WLatency: ', attributes=curses.A_BOLD)
+        self.addstr('%0.2f/%0.2f/%0.2f' % (
             self.header_data[LWRITE_ONE],
             self.header_data[LWRITE_FIVE],
             self.header_data[LWRITE_FIFTEEN]
@@ -446,10 +444,12 @@ class Screen(object):
         columns = [0, 6, 12, 18, 28, 36, 42, 50, 56, 62]
         formats = ['{0:s}', '{0:^5s}', '{0:^5d}', '{0:>9s}',
                    '{0:>6.2f}', '{0:>4.2f}', '{0:>5.0f}', '{0:>4.2f}', '{0:>5.0f}', '{0:>9s}']
+        labels = [' DC ', 'Nodes ', 'Racks', '   Load', ' Comps',
+                  'Rlat', 'Rrate', 'Wlat', 'Wrate', '    Hints']
         key_list = sorted(dc_rollups.keys(), lambda x, y: cmp(
             dc_rollups[y][self.sort_key], dc_rollups[x][self.sort_key]))
         y = 3
-        for idx, label in enumerate([' DC', 'Nodes ', 'Racks', '   Load', ' Comps', 'Rlat', 'Rrate', 'Wlat', 'Wrate', '    Hints']):
+        for idx, label in enumerate(labels):
             if idx == self.sort_key:
                 self.addstr(
                     y, columns[idx], label, attributes=(curses.A_BOLD | self.green))
@@ -459,7 +459,8 @@ class Screen(object):
             y += 1
             self.stdscr.move(y, 0)
             for idx, item in enumerate(dc_rollups[key]):
-                self.addstr(y, columns[idx], formats[idx].format(item))
+                self.addstr(
+                    y, columns[idx], formats[idx].format(item) + '  ', len(labels[idx]))
         pass
 
     @add_summary(functions, 'h', 'Host Data', 9)
