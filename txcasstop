@@ -169,6 +169,17 @@ def humanize(number, format_string='{VALUE:>6.2f} {LABEL}', suffix='B'):
     return format_string.format(VALUE=number, LABEL=label + suffix)
 
 
+def list_sorter(list_two, list_one, index):
+    '''Sort two lists by the index column.  If that column is missing, then
+    that row is "smaller".  The incoming parameters are in inverted order
+    so that we sort DESCENDING.
+
+    '''
+    key_one = list_one[index:index + 1]
+    key_two = list_two[index:index + 1]
+    return cmp(key_one, key_two)
+
+
 class MovingAverages(object):
 
     '''Handle moving averages as often displayed by programs like top(8).'''
@@ -237,6 +248,8 @@ class Screen(object):
     functions = {}
     cluster_compaction_averages = MovingAverages()
     closed = False
+    first_data_line = 3
+    last_data_line = 3
 
     def __init__(self, ring_name):
         '''Initialize Curses and do the first screen painting.
@@ -277,18 +290,6 @@ class Screen(object):
         '''Prefix added to twisted logging functions
         '''
         return 'CursesClient'
-
-    def old_addstr(self, y, x, msg, attributes=None):
-        'DRY wrapper for drawing strings'
-        if not self.rows > y + 1:
-            return False
-        if not self.cols > x + 1:
-            return False
-        if attributes:
-            self.stdscr.addnstr(y, x, msg, self.cols - x - 1, attributes)
-        else:
-            self.stdscr.addnstr(y, x, msg, self.cols - x - 1)
-        return True
 
     def addstr(self, *args, **kwargs):
         'DRY wrapper for drawing strings'
@@ -336,6 +337,7 @@ class Screen(object):
         curses.endwin()
         curses.initscr()
         self.rows, self.cols = self.stdscr.getmaxyx()
+        self.last_data_line = self.rows - 1
         logging.info('Updated screen size to (%d,%d)',
                      self.rows, self.cols)
         self.stdscr.erase()
@@ -346,6 +348,12 @@ class Screen(object):
             self.paintStatus()
         self.stdscr.refresh()
         return
+
+    def clearDataArea(self):
+        for y in range(self.first_data_line, self.last_data_line):
+            self.stdscr.move(y, 0)
+            self.stdscr.clrtoeol()
+        self.stdscr.move(self.first_data_line, 0)
 
     def connectionLost(self, *_):
         """ clean up """
@@ -449,7 +457,8 @@ class Screen(object):
                   'Rlat', 'Rrate', 'Wlat', 'Wrate', '    Hints']
         key_list = sorted(dc_rollups.keys(), lambda x, y: cmp(
             dc_rollups[y][self.sort_key], dc_rollups[x][self.sort_key]))
-        y = 3
+        self.clearDataArea()
+        y = self.first_data_line
         for idx, label in enumerate(labels):
             if idx == self.sort_key:
                 self.addstr(
@@ -470,26 +479,26 @@ class Screen(object):
         logging.debug('paintHostData')
         self.sort_key = self.sort_key % (
             self.current_function.max_sort_key + 1)
-        labels = ['Hostname  ', 'DC   ', 'Rack  ', 'Status   ', 'Load     ',
+        labels = ['Hostname  ', ' DC  ', 'Rack  ', 'Status   ', 'Load     ',
                   'Comps  ', 'Rlat ', 'Rrate  ', 'Wlat ', 'Wrate     ', 'Hints']
         format_string = '{0:s} {1:^5s} {2:^4s} {10:>6s} {3:>9s} {4:> 6.2f} {5:> 4.2f} {6:> 5.0f} {7:> 4.2f} {8:> 5.0f} {9:> 9.2f}'
         local_data = []
         # First, collect out the data we're going to draw.
         for endpoint in endpoints:
+            entry = endpoint.split('.')[:2]
             try:
-                entry = endpoint.split('.')[:2]
                 entry.append(endpoints[endpoint][RACK])
                 entry.append(
                     humanize(endpoints[endpoint][STORAGE_SERVICE]['Load']))
                 entry.append(endpoints[endpoint][COMPACTIONS])
                 entry.append(
+                    endpoints[endpoint][CLIENT_READ_LATENCY][SEVENTY_FIFTH].get_all()[0] / 100000)
+                entry.append(
                     endpoints[endpoint][CLIENT_READ_LATENCY][ONE_MINUTE_RATE])
                 entry.append(
-                    endpoints[endpoint][CLIENT_READ_LATENCY][SEVENTY_FIFTH].get_all()[0])
+                    endpoints[endpoint][CLIENT_WRITE_LATENCY][SEVENTY_FIFTH].get_all()[0] / 100000)
                 entry.append(
                     endpoints[endpoint][CLIENT_WRITE_LATENCY][ONE_MINUTE_RATE])
-                entry.append(
-                    endpoints[endpoint][CLIENT_WRITE_LATENCY][SEVENTY_FIFTH].get_all()[0])
                 entry.append(endpoints[endpoint][HINTS])
                 # Putting this at the end instead of in position 4 for sorting
                 # purposes
@@ -501,26 +510,28 @@ class Screen(object):
                 logging.fatal(str(endpoints[endpoint].keys()))
             local_data.append(entry)
         # Next, we need to sort it.
-        y = 3
-        try:
-            local_data = sorted(
-                local_data, lambda x, y: cmp(y[self.sort_key], x[self.sort_key]))
-            local_key = self.sort_key
-            if local_key > 2:
-                local_key += 1
-            self.stdscr.move(y, 0)
-            for idx, label in enumerate(labels):
-                if idx == local_key:
-                    self.addstr(
-                        label, attributes=(curses.A_BOLD | self.green))
-                else:
-                    self.addstr(
-                        label, attributes=curses.A_BOLD)
-            for row in local_data:
+        self.clearDataArea()
+        y = self.first_data_line
+        self.stdscr.move(y, 0)
+        local_key = self.sort_key
+        if local_key > 2:
+            local_key += 1
+        for idx, label in enumerate(labels):
+            if idx == local_key:
+                attributes = curses.A_BOLD | self.green
+            else:
+                attributes = self.green
+            self.addstr(label, attributes=attributes)
+        local_data.sort(key=lambda x: x[self.sort_key:self.sort_key + 1])
+        self.stdscr.move(y, 0)
+        for row in local_data:
+            try:
                 y += 1
                 self.addstr(y, 0, format_string.format(*row))
-        except Exception as the_exception:
-            logging.fatal(the_exception)
+            except Exception as the_exception:
+                self.addstr(
+                    y, 0, '{0:s} {1:^5s}'.format(*row), attributes=self.red)
+                logging.fatal(the_exception)
 
         pass
 
