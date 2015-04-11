@@ -522,7 +522,10 @@ class Screen(object):
             else:
                 attributes = self.green
             self.addstr(label, attributes=attributes)
-        local_data.sort(key=lambda x: x[self.sort_key:self.sort_key + 1])
+        # The extra [0:2] slice is to help keep things in order by
+        # hostname/DC, everything else being equal.
+        local_data.sort(
+            key=lambda x: x[self.sort_key:self.sort_key + 1] + x[0:2])
         self.stdscr.move(y, 0)
         for row in local_data:
             try:
@@ -861,8 +864,12 @@ def register_hosts(option_group):
             logging.debug(
                 'register_hosts: key - %s', str(row_pieces))
             if row_pieces[0] == 'RPC_ADDRESS':
-                complete_address_set = socket.gethostbyaddr(
-                    row_pieces[1].strip())
+                try:
+                    complete_address_set = socket.gethostbyaddr(
+                        row_pieces[1].strip())
+                except socket.herror:
+                    logging.warn('Unknown host: %s', row_pieces[1].strip())
+                    continue
                 endpoint = complete_address_set[0]
                 endpoints[endpoint] = host_data
             if row_pieces[0] == DATACENTER:
