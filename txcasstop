@@ -506,8 +506,9 @@ class Screen(object):
                     endpoints[endpoint][STORAGE_SERVICE]['OperationMode'])
 
             except Exception as the_exception:
-                logging.fatal(the_exception)
-                logging.fatal(str(endpoints[endpoint].keys()))
+                # this happens when a host is erroring out for whatever reason.
+                logging.debug(the_exception)
+                logging.debug(str(endpoints[endpoint].keys()))
             local_data.append(entry)
         # Next, we need to sort it.
         self.clearDataArea()
@@ -615,8 +616,6 @@ class Screen(object):
         for node in endpoints:
             try:
                 data_block = endpoints[node]
-                if not CLIENT_READ_LATENCY in data_block:
-                    continue
                 single_host_compactions = extract_compactions(data_block)
                 compactions += single_host_compactions
                 our_dc = data_block[DATACENTER]
@@ -671,11 +670,13 @@ class Screen(object):
                 # Do this last, as an exception anywhere above should turn this
                 # into a dead node
                 current_group[1] += 1
+                endpoints[node][STATUS] = True
 
             except Exception as e:
                 logging.critical(traceback.format_exc())
                 self.header_data[DEAD_NODES] += 1
                 self.header_data[LIVE_NODES] -= 1
+                endpoints[node][STATUS] = False
                 current_group[2] += 1
                 logging.warn(
                     'paintClusterRollup: %s - %s', str(e), str(current_group))
