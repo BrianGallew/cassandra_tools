@@ -480,8 +480,8 @@ class Screen(object):
         self.sort_key = self.sort_key % (
             self.current_function.max_sort_key + 1)
         labels = ['Hostname  ', ' DC  ', 'Rack  ', 'Status   ', 'Load     ',
-                  'Comps  ', 'Rlat ', 'Rrate  ', 'Wlat ', 'Wrate     ', 'Hints']
-        format_string = '{0:s} {1:^5s} {2:^4s} {10:>6s} {3:>9s} {4:> 6.2f} {5:> 4.2f} {6:> 5.0f} {7:> 4.2f} {8:> 5.0f} {9:> 9.2f}'
+                  'Comps   ', 'Rlat ', 'Rrate   ', 'Wlat ', 'Wrate     ', 'Hints']
+        format_string = '{0:s} {1:^5s} {2:^4s} {10:>6s} {3:>9s} {4:> 6.2f} {5:> 6.2f} {6:> 5.0f} {7:> 6.2f} {8:> 5.0f} {9:> 9.2f}'
         local_data = []
         # First, collect out the data we're going to draw.
         for endpoint in endpoints:
@@ -535,7 +535,7 @@ class Screen(object):
             except Exception as the_exception:
                 self.addstr(
                     y, 0, '{0:s} {1:^5s}'.format(*row), attributes=self.red)
-                logging.fatal(the_exception)
+                logging.debug(the_exception)
 
         pass
 
